@@ -215,46 +215,89 @@ def parse_listings_from_html(base_url: str, html: str) -> List[Listing]:
 
 def llm_extract_details(description: str, hf_token: str, model_id: str) -> Dict[str, Any]:
     if not hf_token: return {}
-    trimmed_desc = description[:2000]
-    prompt = f"Analyze the following apartment listing in Zurich. Extract into a JSON object with keys: furnished (bool), has_kitchen (bool), has_bathroom (bool), has_living_room (bool), has_sofa (bool), has_washing_machine (bool), has_dishwasher (bool), likely_shared (bool), bedrooms (float), total_rooms (float), available_from (YYYY-MM-DD). If unsure, use null. Output ONLY the JSON.\n\nDescription:\n{trimmed_desc}"
+    trimmed_desc = description[:2500]
+    
+    # Enhanced prompt for better "shared flat" detection
+    prompt = f"""[INST] Task: Extract apartment data from a Swiss listing (German/English/Italian).
+Strictly identify if this is a 'shared flat' (WG, Mitbewohner, room for rent, stanza, camera, coabitazione).
+Criteria for 'likely_shared': True if the advertiser is looking for a roommate, or if only a 'room' (Zimmer/Stanza) is for rent rather than the 'entire place'.
+
+JSON Keys required:
+- furnished (bool)
+- has_kitchen (bool)
+- has_bathroom (bool)
+- has_living_room (bool)
+- has_sofa (bool)
+- has_washing_machine (bool)
+- has_dishwasher (bool)
+- likely_shared (bool)
+- bedrooms (float)
+- total_rooms (float)
+- available_from (YYYY-MM-DD or null)
+
+Description:
+{trimmed_desc}
+
+Output ONLY the JSON object. [/INST]"""
+
     headers = {"Authorization": f"Bearer {hf_token}"}
     api_url = f"https://api-inference.huggingface.co/models/{model_id}"
     try:
-        response = requests.post(api_url, headers=headers, json={"inputs": prompt, "parameters": {"return_full_text": False}}, timeout=30)
+        response = requests.post(api_url, headers=headers, json={"inputs": prompt, "parameters": {"return_full_text": False, "temperature": 0.1}}, timeout=30)
         if response.status_code != 200: return {}
-        raw_text = response.json()[0].get("generated_text", "")
+        res_json = response.json()
+        raw_text = res_json[0].get("generated_text", "") if isinstance(res_json, list) else res_json.get("generated_text", "")
         json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         return json.loads(json_match.group(0)) if json_match else {}
     except Exception: return {}
 
 def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg: Dict[str, Any]):
+    # Robust pre-filter keywords for shared flats to catch them before LLM
+    SHARED_KEYWORDS = ["mitbewohner", "wg-zimmer", "wohngemeinschaft", "shared flat", "stanza in", "roommate", "coloc"]
+    
     total = len(listings)
     hf_token = llm_cfg.get("token")
     model_id = llm_cfg.get("model_id", "mistralai/Mistral-7B-Instruct-v0.2")
-    logger.info(f"Hydrating {total} listings via LLM...")
+    logger.info(f"Hydrating {total} listings via Hybrid LLM...")
+    
     for idx, l in enumerate(listings, 1):
         try:
-            logger.info(f"[{idx}/{total}] LLM Processing: {l.title[:30]}...")
+            logger.info(f"[{idx}/{total}] Processing: {l.title[:30]}...")
             r = requests.get(l.url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
             if r.status_code >= 400: continue
+            
             soup = BeautifulSoup(r.text, "html.parser")
             for s in soup(["script", "style"]): s.decompose()
             text = normalize_spaces(soup.get_text(" ", strip=True))
-            l.description = text[:3000]
+            l.description = text[:4000]
+            
+            # 1. Coordinate & Distance
             l.lat, l.lon = extract_coords(r.text)
             if l.lat and l.lon: l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
+            
+            # 2. Hard Pre-filter for Shared Flats (Catch obvious ones)
+            desc_lower = l.description.lower()
+            if any(k in desc_lower for k in SHARED_KEYWORDS):
+                l.likely_shared = True
+                logger.debug(f"Pre-flagged as shared: {l.url}")
+            
+            # 3. LLM Extraction
             data = llm_extract_details(l.description, hf_token, model_id)
+            
+            # LLM usually wins but we merge with pre-filter
+            l.likely_shared = l.likely_shared or data.get("likely_shared", False)
             l.furnished = data.get("furnished", l.furnished)
             l.has_kitchen = data.get("has_kitchen", l.has_kitchen)
             l.has_living_room = data.get("has_living_room", l.has_living_room)
             l.has_sofa = data.get("has_sofa", l.has_sofa)
             l.has_washing_machine = data.get("has_washing_machine", l.has_washing_machine)
             l.has_dishwasher = data.get("has_dishwasher", l.has_dishwasher)
-            l.likely_shared = data.get("likely_shared", l.likely_shared)
+            
             l.price_chf = l.price_chf or parse_price(text)
             l.available_from = parse_date(data.get("available_from")) or parse_date(text)
             l.bedrooms = data.get("bedrooms") or l.bedrooms
             l.total_rooms = data.get("total_rooms") or l.total_rooms
+            
             time.sleep(delay)
         except Exception as e: logger.error(f"Error {l.url}: {e}")
 
