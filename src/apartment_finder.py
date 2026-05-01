@@ -216,31 +216,69 @@ def parse_listings_from_html(base_url: str, html: str) -> List[Listing]:
     listings: List[Listing] = []
     soup = BeautifulSoup(html, "html.parser")
 
-    # Try Flatfox specific data-json or scripts
+    # Try LD+JSON first
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             doc = json.loads(script.get_text(strip=True))
-            # Handle potential list or single object
             nodes = doc if isinstance(doc, list) else [doc]
             for node in nodes:
-                if "@type" in node and "Product" in node["@type"] or "Accommodation" in str(node.get("@type")):
+                if isinstance(node, dict) and ("Product" in str(node.get("@type")) or "Accommodation" in str(node.get("@type"))):
                     l = build_listing_from_ld_json("flatfox", base_url, node)
                     if l: listings.append(l)
-        except Exception as e:
-            logger.debug(f"Failed to parse LD+JSON: {e}")
+        except Exception:
+            pass
 
-    # Fallback to broad link scraping if needed
+    # Specific Flatfox listing cards
+    for thumb in soup.select(".listing-thumb"):
+        link_tag = thumb.select_one("a.listing-thumb__image, a.listing-thumb-title")
+        if not link_tag: continue
+        href = link_tag.get("href")
+        if not href: continue
+        
+        url = to_absolute(base_url, href)
+        title = normalize_spaces(thumb.select_one(".listing-thumb-title").get_text()) if thumb.select_one(".listing-thumb-title") else "Untitled"
+        price_tag = thumb.select_one(".price")
+        price = parse_price(price_tag.get_text()) if price_tag else None
+        
+        # Address/Location
+        loc_tag = thumb.select_one(".listing-thumb-title__location")
+        address = normalize_spaces(loc_tag.get_text()) if loc_tag else ""
+        
+        # Attributes (Furnished, etc.)
+        attrs_text = normalize_spaces(thumb.select_one(".attributes").get_text(" ")) if thumb.select_one(".attributes") else ""
+        
+        listings.append(Listing(
+            provider="flatfox",
+            listing_id=str(abs(hash(url))),
+            title=title,
+            url=url,
+            contact_url=url,
+            price_chf=price,
+            bedrooms=None, # Will hydrate
+            total_rooms=None, # Will hydrate
+            available_from=None, # Will hydrate
+            furnished=infer_bool_from_text(attrs_text + " " + title, "furnished"),
+            has_kitchen=None,
+            has_bathroom=None,
+            has_living_room=None,
+            has_sofa=None,
+            has_washing_machine=None,
+            has_dishwasher=None,
+            likely_shared=infer_likely_shared(attrs_text + " " + title),
+            address=address,
+            description=attrs_text
+        ))
+
+    # General fallback
     if not listings:
-        logger.info("No LD+JSON listings found, falling back to link scraping.")
-        # This is a bit brittle but better than nothing
-        for a in soup.select('a[href*="/rent/"], a[href*="/listing/"]'):
+        logger.info("No specific listing cards found, falling back to broad link scraping.")
+        for a in soup.select('a[href*="/flat/"], a[href*="/listing/"], a[href*="/rent/"]'):
             href = a.get("href")
-            if not href: continue
+            if not href or len(href) < 10: continue
             url = to_absolute(base_url, href)
-            # Basic stub
             listings.append(Listing(
                 provider="flatfox", listing_id=str(abs(hash(url))),
-                title=normalize_spaces(a.get_text()), url=url, contact_url=url,
+                title=normalize_spaces(a.get_text()) or "Listing", url=url, contact_url=url,
                 price_chf=None, bedrooms=None, total_rooms=None, available_from=None,
                 furnished=None, has_kitchen=None, has_bathroom=None, has_living_room=None,
                 has_sofa=None, has_washing_machine=None, has_dishwasher=None,
@@ -295,21 +333,28 @@ def dedupe_listings(listings: List[Listing]) -> List[Listing]:
     return list(seen.values())
 
 def hydrate_details(listings: List[Listing], timeout: int, delay: float):
-    logger.info(f"Hydrating details for {len(listings)} listings...")
+    total = len(listings)
+    logger.info(f"Hydrating details for {total} listings (estimated time: {total * (delay + 1):.0f}s)...")
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    for l in listings:
+    for idx, l in enumerate(listings, 1):
         try:
-            logger.debug(f"Fetching details for: {l.url}")
+            if idx % 5 == 0 or idx == 1 or idx == total:
+                logger.info(f"[{idx}/{total}] Processing: {l.title[:30]}...")
+            
             r = requests.get(l.url, headers=headers, timeout=timeout)
             if r.status_code >= 400:
                 logger.warning(f"Failed to fetch {l.url}: HTTP {r.status_code}")
                 continue
             
             soup = BeautifulSoup(r.text, "html.parser")
+            # Remove script and style elements from text extraction
+            for script_or_style in soup(["script", "style"]):
+                script_or_style.decompose()
+                
             text = normalize_spaces(soup.get_text(" ", strip=True))
-            l.description = text[:5000] # Cap description size
+            l.description = text[:5000]
             
-            # Update fields if missing
+            # Update fields
             l.price_chf = l.price_chf or parse_price(text)
             l.available_from = l.available_from or parse_date(text)
             b, t = infer_bedrooms(text)
@@ -317,19 +362,25 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float):
             l.total_rooms = l.total_rooms or t
             
             for cat in KEYWORDS:
-                field_name = f"has_{cat}" if cat not in ["furnished", "sofa"] else cat
-                if cat == "furnished": field_name = "furnished"
-                if cat == "sofa": field_name = "has_sofa"
-                if cat == "living": field_name = "has_living_room"
-                
-                current_val = getattr(l, field_name)
-                if current_val is None:
-                    setattr(l, field_name, infer_bool_from_text(text, cat))
+                field_map = {
+                    "furnished": "furnished",
+                    "sofa": "has_sofa",
+                    "living": "has_living_room",
+                    "kitchen": "has_kitchen",
+                    "bathroom": "has_bathroom",
+                    "washing_machine": "has_washing_machine",
+                    "dishwasher": "has_dishwasher"
+                }
+                field_name = field_map.get(cat)
+                if field_name:
+                    current_val = getattr(l, field_name)
+                    if current_val is None:
+                        setattr(l, field_name, infer_bool_from_text(text, cat))
             
             if l.likely_shared is None:
                 l.likely_shared = infer_likely_shared(text)
             
-            # Look for contact button/link
+            # Contact button
             contact_btn = soup.select_one('a[href*="/contact"], a[href*="mailto:"], button[data-href*="contact"]')
             if contact_btn:
                 l.contact_url = to_absolute(l.url, contact_btn.get("href") or contact_btn.get("data-href"))

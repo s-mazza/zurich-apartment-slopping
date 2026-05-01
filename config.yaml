@@ -10,8 +10,8 @@ search:
     playwright:
       enabled: true
       headless: false # Set to true for production, false to debug challenges
-      wait_after_load_seconds: 8
-      challenge_wait_seconds: 25
+      wait_after_load_seconds: 12
+      challenge_wait_seconds: 30
       manual_continue: true
       dump_html_path: "output/raw_search_playwright.html"
       # If blocked, provide cookies from your browser session here:
