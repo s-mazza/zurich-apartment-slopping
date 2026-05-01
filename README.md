@@ -4,7 +4,7 @@ Script per raccogliere annunci da Flatfox, filtrarli con criteri configurabili e
 
 - `output/listings_filtered.csv`
 - `output/listings_filtered.md` (con link cliccabili, incluso contatto 1-click)
-- `output/quick_contact_message.txt`
+- `quick_contact_message.txt`
 
 ## Setup
 
