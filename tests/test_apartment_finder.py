@@ -116,39 +116,54 @@ def base_listing():
 
 def test_filter_pass(base_listing):
     criteria = {"min_bedrooms": 2, "must_be_furnished": True, "available_on_or_before": "2026-06-15"}
-    assert listing_passes_filters(base_listing, criteria) is True
+    is_pass, reasons = listing_passes_filters(base_listing, criteria)
+    assert is_pass is True
+    assert len(reasons) == 0
 
 def test_filter_fail_bedrooms(base_listing):
     base_listing.bedrooms = 1.0
     criteria = {"min_bedrooms": 2}
-    assert listing_passes_filters(base_listing, criteria) is False
+    is_pass, reasons = listing_passes_filters(base_listing, criteria)
+    assert is_pass is False
+    assert any("Bedrooms" in r for r in reasons)
 
 def test_filter_fail_date(base_listing):
     base_listing.available_from = date(2026, 7, 1)
     criteria = {"available_on_or_before": "2026-06-15"}
-    assert listing_passes_filters(base_listing, criteria) is False
+    is_pass, reasons = listing_passes_filters(base_listing, criteria)
+    assert is_pass is False
+    assert any("Available date" in r for r in reasons)
 
 def test_filter_fail_furnished(base_listing):
     base_listing.furnished = False
     criteria = {"must_be_furnished": True}
-    assert listing_passes_filters(base_listing, criteria) is False
+    is_pass, reasons = listing_passes_filters(base_listing, criteria)
+    assert is_pass is False
+    assert "Not furnished" in reasons
 
 def test_filter_fail_shared(base_listing):
     base_listing.likely_shared = True
     criteria = {"must_have_private_entire_place": True}
-    assert listing_passes_filters(base_listing, criteria) is False
+    is_pass, reasons = listing_passes_filters(base_listing, criteria)
+    assert is_pass is False
+    assert "Likely shared/WG" in reasons
 
 def test_filter_fail_kitchen(base_listing):
     base_listing.has_kitchen = False
     criteria = {"must_have_kitchen": True}
-    assert listing_passes_filters(base_listing, criteria) is False
+    is_pass, reasons = listing_passes_filters(base_listing, criteria)
+    assert is_pass is False
+    assert "No kitchen" in reasons
 
 def test_filter_include_unknown(base_listing):
     base_listing.furnished = None
     criteria = {"must_be_furnished": True, "include_unknowns_to_avoid_false_negatives": True}
-    assert listing_passes_filters(base_listing, criteria) is True
+    is_pass, reasons = listing_passes_filters(base_listing, criteria)
+    assert is_pass is True
 
 def test_filter_exclude_unknown(base_listing):
     base_listing.furnished = None
     criteria = {"must_be_furnished": True, "include_unknowns_to_avoid_false_negatives": False}
-    assert listing_passes_filters(base_listing, criteria) is False
+    is_pass, reasons = listing_passes_filters(base_listing, criteria)
+    assert is_pass is False
+    assert "Not furnished (unknown)" in reasons

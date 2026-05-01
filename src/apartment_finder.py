@@ -483,41 +483,40 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float):
             logger.error(f"Error hydrating {l.url}: {e}")
             l.warnings.append(f"hydration_error: {e}")
 
-def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> bool:
+def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[bool, List[str]]:
     include_unknown = bool(criteria.get("include_unknowns_to_avoid_false_negatives", True))
+    reasons = []
     
     # Date filter
     target_date = parse_date(criteria.get("available_on_or_before"))
     if target_date and listing.available_from:
         if listing.available_from > target_date:
-            logger.debug(f"Excluded {listing.listing_id}: Available from {listing.available_from} > {target_date}")
-            return False
-    elif target_date and not include_unknown:
-        return False
+            reasons.append(f"Available date {listing.available_from} > {target_date}")
+    elif target_date and not include_unknown and not listing.available_from:
+        reasons.append("Available date unknown")
 
     # Bedrooms filter
     min_bed = float(criteria.get("min_bedrooms", 2))
     current_bed = listing.bedrooms
     if current_bed is None and listing.total_rooms:
-        current_bed = max(1.0, listing.total_rooms - 1.0) # Heuristic
+        current_bed = max(1.0, listing.total_rooms - 1.0)
     
     if current_bed is not None and current_bed < min_bed:
-        logger.debug(f"Excluded {listing.listing_id}: {current_bed} bedrooms < {min_bed}")
-        return False
+        reasons.append(f"Bedrooms {current_bed} < {min_bed}")
     elif current_bed is None and not include_unknown:
-        return False
+        reasons.append("Bedrooms unknown")
 
     # Boolean flags
     filters = [
-        ("must_be_furnished", "furnished"),
-        ("must_have_private_entire_place", "likely_shared", True), # negate
-        ("must_have_kitchen", "has_kitchen"),
-        ("must_have_bathroom", "has_bathroom"),
-        ("must_have_living_room", "has_living_room"),
-        ("must_have_sofa", "has_sofa"),
+        ("must_be_furnished", "furnished", "Not furnished"),
+        ("must_have_private_entire_place", "likely_shared", "Likely shared/WG", True), # negate
+        ("must_have_kitchen", "has_kitchen", "No kitchen"),
+        ("must_have_bathroom", "has_bathroom", "No bathroom"),
+        ("must_have_living_room", "has_living_room", "No living room"),
+        ("must_have_sofa", "has_sofa", "No sofa"),
     ]
     
-    for crit_key, field_name, *negate in filters:
+    for crit_key, field_name, error_msg, *negate in filters:
         required = criteria.get(crit_key, False)
         if not required: continue
         
@@ -527,12 +526,11 @@ def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> bool:
         actual_val = not val if is_negated and val is not None else val
         
         if actual_val is False:
-            logger.debug(f"Excluded {listing.listing_id}: Failed {crit_key} (val={val})")
-            return False
-        if val is None and not include_unknown:
-            return False
+            reasons.append(error_msg)
+        elif val is None and not include_unknown:
+            reasons.append(f"{error_msg} (unknown)")
             
-    return True
+    return len(reasons) == 0, reasons
 
 def run(config_path: Path):
     cfg = load_config(config_path)
@@ -548,7 +546,6 @@ def run(config_path: Path):
         logger.info("Starting Flatfox search...")
         
         html = None
-        # Try direct requests first (fast)
         try:
             r = requests.get(ff["search_url"], timeout=ff.get("request_timeout_seconds", 20))
             if not is_challenge_html(r.text):
@@ -569,14 +566,22 @@ def run(config_path: Path):
         else:
             logger.error("Could not retrieve search page.")
 
-    # Filtering
-    filtered = [l for l in all_listings if listing_passes_filters(l, criteria)]
+    # Filtering and Auditing
+    filtered = []
+    excluded = []
+    for l in all_listings:
+        is_pass, reasons = listing_passes_filters(l, criteria)
+        if is_pass:
+            filtered.append(l)
+        else:
+            excluded.append((l, reasons))
+
     # Sorting
     ordered = sorted(filtered, key=lambda x: (x.price_chf or 999999), reverse=True)
     
-    logger.info(f"Total: {len(all_listings)}, Filtered: {len(ordered)}")
+    logger.info(f"Total: {len(all_listings)}, Filtered: {len(ordered)}, Excluded: {len(excluded)}")
     
-    # Export
+    # Export Filtered
     md_path = output_dir / "listings_filtered.md"
     lines = ["# Zurich Apartment Search Results", f"Generated on {date.today()}", ""]
     for i, l in enumerate(ordered, 1):
@@ -597,7 +602,26 @@ def run(config_path: Path):
             ""
         ])
     md_path.write_text("\n".join(lines), encoding="utf-8")
-    logger.info(f"Results exported to {md_path}")
+    
+    # Export Excluded for Audit
+    excl_path = output_dir / "listings_excluded.md"
+    excl_lines = ["# Excluded Listings (Audit Log)", f"Generated on {date.today()}", ""]
+    for i, (l, reasons) in enumerate(excluded, 1):
+        price = f"CHF {l.price_chf:,.0f}".replace(",", "'") if l.price_chf else "Unknown"
+        reasons_str = ", ".join(reasons)
+        excl_lines.extend([
+            f"## {i}. {l.title}",
+            f"- **REASONS FOR EXCLUSION**: **{reasons_str}**",
+            f"- **Price**: {price}",
+            f"- **Bedrooms**: {l.bedrooms or 'n/a'} (Total rooms: {l.total_rooms or 'n/a'})",
+            f"- **Available**: {l.available_from or 'Unknown'}",
+            f"- **Address**: {l.address or 'n/a'}",
+            f"- [View Listing]({l.url})",
+            ""
+        ])
+    excl_path.write_text("\n".join(excl_lines), encoding="utf-8")
+    
+    logger.info(f"Results exported to {md_path} and audit log to {excl_path}")
 
 if __name__ == "__main__":
     run(Path("config.yaml"))
