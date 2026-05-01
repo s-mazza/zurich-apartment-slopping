@@ -60,6 +60,12 @@ KEYWORDS = {
     "dishwasher": ["dishwasher", "geschirrspüler", "lavastoviglie", "lave-vaisselle", "spülmaschine"]
 }
 
+import math
+
+# Reference office coordinates: Europaallee 1, Zurich
+OFFICE_LAT = 47.3781
+OFFICE_LON = 8.5342
+
 @dataclass
 class Listing:
     provider: str
@@ -81,8 +87,39 @@ class Listing:
     likely_shared: Optional[bool]
     address: Optional[str]
     description: str
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    distance_km: Optional[float] = None
     raw: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+
+def haversine(lat1, lon1, lat2, lon2) -> float:
+    R = 6371  # Earth radius in km
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * \
+        math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+def extract_coords(html: str) -> Tuple[Optional[float], Optional[float]]:
+    # Try Flatfox bounding box pattern (center of similar objects search)
+    m = re.search(r'north=([\d.]+)&amp;east=([\d.]+)&amp;south=([\d.]+)&amp;west=([\d.]+)', html)
+    if m:
+        n, e, s, w = map(float, m.groups())
+        return (n + s) / 2, (e + w) / 2
+        
+    # Standard JSON patterns
+    m = re.search(r'"latitude":\s*([\d.]+),"longitude":\s*([\d.]+)', html)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    
+    # Try alternate pattern
+    m = re.search(r'lat[:=]\s*([\d.]+),?\s*lon[:=]\s*([\d.]+)', html, re.I)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    
+    return None, None
 
 def load_config(config_path: Path) -> Dict[str, Any]:
     try:
@@ -378,6 +415,11 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float):
             l.bedrooms = l.bedrooms or b
             l.total_rooms = l.total_rooms or t
             
+            # Extract coordinates and calculate distance
+            l.lat, l.lon = extract_coords(r.text)
+            if l.lat and l.lon:
+                l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
+            
             for cat in KEYWORDS:
                 field_map = {
                     "furnished": "furnished",
@@ -505,9 +547,11 @@ def run(config_path: Path):
     lines = ["# Zurich Apartment Search Results", f"Generated on {date.today()}", ""]
     for i, l in enumerate(ordered, 1):
         price = f"CHF {l.price_chf:,.0f}".replace(",", "'") if l.price_chf else "Unknown"
+        dist_info = f"{l.distance_km:.2f} km" if l.distance_km is not None else "Unknown"
         lines.extend([
             f"## {i}. {l.title}",
             f"- **Price**: {price}",
+            f"- **Distance to Office**: {dist_info}",
             f"- **Bedrooms**: {l.bedrooms or 'n/a'} (Total rooms: {l.total_rooms or 'n/a'})",
             f"- **Available**: {l.available_from or 'Unknown'}",
             f"- **Furnished**: {l.furnished}",
