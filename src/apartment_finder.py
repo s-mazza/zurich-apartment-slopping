@@ -32,10 +32,10 @@ except Exception:  # pragma: no cover
     sync_playwright = None
 
 # Regex patterns
-MONEY_REGEX = re.compile(r"(\d[\d'’‘,. ]{2,})")
+MONEY_REGEX = re.compile(r"(\d[\d'’‘,. ]*)")
 DATE_REGEX = re.compile(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})")
 BEDROOM_REGEX = re.compile(
-    r"(?:(\d+(?:[.,]\d+)?)\s*(?:bedroom|bedrooms|schlafzimmer|chambre|camera(?: da letto)?|zimmer|stanze da letto))",
+    r"(?:(?<!\.)(\d+)\s*(?:bedroom|bedrooms|schlafzimmer|chambre|camera|camere|stanze da letto))",
     re.IGNORECASE,
 )
 TOTAL_ROOMS_REGEX = re.compile(
@@ -73,20 +73,20 @@ class Listing:
     title: str
     url: str
     contact_url: str
-    price_chf: Optional[float]
-    bedrooms: Optional[float]
-    total_rooms: Optional[float]
-    available_from: Optional[date]
-    furnished: Optional[bool]
-    has_kitchen: Optional[bool]
-    has_bathroom: Optional[bool]
-    has_living_room: Optional[bool]
-    has_sofa: Optional[bool]
-    has_washing_machine: Optional[bool]
-    has_dishwasher: Optional[bool]
-    likely_shared: Optional[bool]
-    address: Optional[str]
-    description: str
+    price_chf: Optional[float] = None
+    bedrooms: Optional[float] = None
+    total_rooms: Optional[float] = None
+    available_from: Optional[date] = None
+    furnished: Optional[bool] = None
+    has_kitchen: Optional[bool] = None
+    has_bathroom: Optional[bool] = None
+    has_living_room: Optional[bool] = None
+    has_sofa: Optional[bool] = None
+    has_washing_machine: Optional[bool] = None
+    has_dishwasher: Optional[bool] = None
+    likely_shared: Optional[bool] = None
+    address: Optional[str] = None
+    description: str = ""
     lat: Optional[float] = None
     lon: Optional[float] = None
     distance_km: Optional[float] = None
@@ -138,16 +138,50 @@ def parse_price(raw: Any) -> Optional[float]:
     text = str(raw)
     
     # Try to find price near currency or rent hint first if it's a large text
+    context_found = False
     if len(text) > 50:
         chf_match = re.search(r"(?:CHF|affitto|rent|prezzo|preis|gross|net)\s*[:\-\s]*([\d'’‘,. ]{3,})", text, re.I)
         if chf_match:
             text = chf_match.group(1)
+            context_found = True
+    elif "CHF" in text.upper():
+        context_found = True
             
     m = MONEY_REGEX.search(text)
     if not m: return None
     
     # Clean up all types of apostrophes and spaces
-    cleaned = re.sub(r"['’‘\s]", "", m.group(1))
+    raw_val = m.group(1).strip()
+    if not raw_val: return None
+    
+    cleaned = re.sub(r"['’‘\s]", "", raw_val)
+    
+    # Handle thousands separators vs decimals
+    if "." in cleaned and "," in cleaned:
+        if cleaned.find(".") < cleaned.find(","): # 1.200,00
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else: # 1,200.00
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        # 1,200 or 1,2
+        if len(cleaned.split(",")[-1]) == 2: # Likely decimal
+            cleaned = cleaned.replace(",", ".")
+        else: # Likely thousands
+            cleaned = cleaned.replace(",", "")
+    elif "." in cleaned:
+        # 1.200 or 1.2
+        if len(cleaned.split(".")[-1]) == 2: # Decimal
+            pass
+        else: # Thousands
+            cleaned = cleaned.replace(".", "")
+            
+    try:
+        val = float(cleaned)
+        if 8000 <= val <= 8999 and not context_found:
+             return None
+        return val
+    except ValueError:
+        return None
     
     # Handle decimal comma vs thousands separator
     if cleaned.count(",") == 1 and "." not in cleaned:
