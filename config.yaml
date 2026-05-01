@@ -7,15 +7,16 @@ search:
     params:
       query: "Europaallee"
       place_name: "Europaallee, 8004 Zurich, Switzerland"
-      north: 47.392608
-      east: 8.603475
-      south: 47.358851
-      west: 8.485409
+      north: 47.42
+      south: 47.32
+      east: 8.63
+      west: 8.45
       min_rooms: 3
       is_furnished: "true"
       is_swap: "false"
       ordering: "price_display"
-      take: 48
+      take: 1000
+      max_price: 3600
     request_timeout_seconds: 30
     detail_request_delay_seconds: 1.0 # Be gentle to avoid blocks
     use_playwright_fallback: true
