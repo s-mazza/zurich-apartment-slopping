@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     sync_playwright = None
 
 # Regex patterns
-MONEY_REGEX = re.compile(r"(\d[\d'., ]{2,})")
+MONEY_REGEX = re.compile(r"(\d[\d'’‘,. ]{2,})")
 DATE_REGEX = re.compile(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})")
 BEDROOM_REGEX = re.compile(
     r"(?:(\d+(?:[.,]\d+)?)\s*(?:bedroom|bedrooms|schlafzimmer|chambre|camera(?: da letto)?|zimmer|stanze da letto))",
@@ -99,15 +99,32 @@ def parse_price(raw: Any) -> Optional[float]:
     if raw is None: return None
     if isinstance(raw, (int, float)): return float(raw)
     text = str(raw)
+    
+    # Try to find price near currency or rent hint first if it's a large text
+    if len(text) > 50:
+        chf_match = re.search(r"(?:CHF|affitto|rent|prezzo|preis|gross|net)\s*[:\-\s]*([\d'’‘,. ]{3,})", text, re.I)
+        if chf_match:
+            text = chf_match.group(1)
+            
     m = MONEY_REGEX.search(text)
     if not m: return None
-    cleaned = m.group(1).replace("'", "").replace(" ", "")
+    
+    # Clean up all types of apostrophes and spaces
+    cleaned = re.sub(r"['’‘\s]", "", m.group(1))
+    
+    # Handle decimal comma vs thousands separator
     if cleaned.count(",") == 1 and "." not in cleaned:
         cleaned = cleaned.replace(",", ".")
     else:
         cleaned = cleaned.replace(",", "")
+        
     try:
-        return float(cleaned)
+        val = float(cleaned)
+        # Sanity check: ZIP codes in Zurich are 8000-8099. 
+        # If it looks like a ZIP and we're parsing a large text without explicit CHF context, skip.
+        if 8000 <= val <= 8999 and len(str(raw)) > 50 and "CHF" not in str(raw).upper():
+             return None
+        return val
     except ValueError:
         return None
 
@@ -487,7 +504,7 @@ def run(config_path: Path):
     md_path = output_dir / "listings_filtered.md"
     lines = ["# Zurich Apartment Search Results", f"Generated on {date.today()}", ""]
     for i, l in enumerate(ordered, 1):
-        price = f"CHF {l.price_chf:,.0f}" if l.price_chf else "Unknown"
+        price = f"CHF {l.price_chf:,.0f}".replace(",", "'") if l.price_chf else "Unknown"
         lines.extend([
             f"## {i}. {l.title}",
             f"- **Price**: {price}",
