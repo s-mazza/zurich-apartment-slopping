@@ -67,6 +67,7 @@ class Listing:
     has_washing_machine: Optional[bool] = None
     has_dishwasher: Optional[bool] = None
     likely_shared: Optional[bool] = None
+    is_temporary: Optional[bool] = None
     address: Optional[str] = None
     description: str = ""
     lat: Optional[float] = None
@@ -188,15 +189,6 @@ def fetch_with_playwright(search_url: str, playwright_cfg: Dict[str, Any]) -> Op
         logger.error(f"Playwright error: {exc}")
         return None
 
-def build_listing_from_ld_json(provider: str, base_url: str, node: Dict[str, Any]) -> Optional[Listing]:
-    url = urljoin(base_url, node.get("url"))
-    if url == base_url: return None
-    return Listing(
-        provider=provider, listing_id=str(node.get("@id") or abs(hash(url))),
-        title=normalize_spaces(node.get("name", "Untitled")), url=url, contact_url=url,
-        description=normalize_spaces(node.get("description", ""))
-    )
-
 def parse_listings_from_html(base_url: str, html: str) -> List[Listing]:
     listings: List[Listing] = []
     soup = BeautifulSoup(html, "html.parser")
@@ -216,11 +208,9 @@ def parse_listings_from_html(base_url: str, html: str) -> List[Listing]:
 def llm_extract_details(description: str, hf_token: str, model_id: str) -> Dict[str, Any]:
     if not hf_token: return {}
     trimmed_desc = description[:2500]
-    
-    # Enhanced prompt for better "shared flat" detection
-    prompt = f"""[INST] Task: Extract apartment data from a Swiss listing (German/English/Italian).
-Strictly identify if this is a 'shared flat' (WG, Mitbewohner, room for rent, stanza, camera, coabitazione).
-Criteria for 'likely_shared': True if the advertiser is looking for a roommate, or if only a 'room' (Zimmer/Stanza) is for rent rather than the 'entire place'.
+    prompt = f"""[INST] Task: Extract apartment data from a Swiss listing.
+Check carefully if it is a 'temporary' rental (sublet, 'befristet', 'Untermiete', 'temporaneo', 'periodo limitato', 'short term').
+Check if it is a 'shared flat' (WG, Mitbewohner, room for rent, stanza, camera, coabitazione).
 
 JSON Keys required:
 - furnished (bool)
@@ -231,6 +221,7 @@ JSON Keys required:
 - has_washing_machine (bool)
 - has_dishwasher (bool)
 - likely_shared (bool)
+- is_temporary (bool)
 - bedrooms (float)
 - total_rooms (float)
 - available_from (YYYY-MM-DD or null)
@@ -239,70 +230,63 @@ Description:
 {trimmed_desc}
 
 Output ONLY the JSON object. [/INST]"""
-
     headers = {"Authorization": f"Bearer {hf_token}"}
     api_url = f"https://api-inference.huggingface.co/models/{model_id}"
     try:
-        response = requests.post(api_url, headers=headers, json={"inputs": prompt, "parameters": {"return_full_text": False, "temperature": 0.1}}, timeout=30)
+        payload = {
+            "inputs": prompt, 
+            "parameters": {"return_full_text": False, "temperature": 0.1, "max_new_tokens": 1500},
+            "options": {"wait_for_model": True}
+        }
+        response = requests.post(api_url, headers=headers, json=payload, timeout=90)
         if response.status_code != 200: return {}
         res_json = response.json()
         raw_text = res_json[0].get("generated_text", "") if isinstance(res_json, list) else res_json.get("generated_text", "")
-        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        clean_text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL).strip()
+        json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
         return json.loads(json_match.group(0)) if json_match else {}
     except Exception: return {}
 
 def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg: Dict[str, Any]):
-    # Robust pre-filter keywords for shared flats to catch them before LLM
     SHARED_KEYWORDS = ["mitbewohner", "wg-zimmer", "wohngemeinschaft", "shared flat", "stanza in", "roommate", "coloc"]
-    
+    TEMP_KEYWORDS = ["befristet", "untermiete", "sublet", "temporary", "short term", "fino al", "bis zum"]
     total = len(listings)
     hf_token = llm_cfg.get("token")
-    model_id = llm_cfg.get("model_id", "mistralai/Mistral-7B-Instruct-v0.2")
-    logger.info(f"Hydrating {total} listings via Hybrid LLM...")
-    
+    model_id = llm_cfg.get("model_id")
+    logger.info(f"Hydrating {total} listings via Hybrid LLM ({model_id})...")
     for idx, l in enumerate(listings, 1):
         try:
             logger.info(f"[{idx}/{total}] Processing: {l.title[:30]}...")
             r = requests.get(l.url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
             if r.status_code >= 400: continue
-            
             soup = BeautifulSoup(r.text, "html.parser")
             for s in soup(["script", "style"]): s.decompose()
             text = normalize_spaces(soup.get_text(" ", strip=True))
             l.description = text[:4000]
-            
-            # 1. Coordinate & Distance
             l.lat, l.lon = extract_coords(r.text)
             if l.lat and l.lon: l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
             
-            # 2. Hard Pre-filter for Shared Flats (Catch obvious ones)
             desc_lower = l.description.lower()
-            if any(k in desc_lower for k in SHARED_KEYWORDS):
-                l.likely_shared = True
-                logger.debug(f"Pre-flagged as shared: {l.url}")
+            if any(k in desc_lower for k in SHARED_KEYWORDS): l.likely_shared = True
+            if any(k in desc_lower for k in TEMP_KEYWORDS): l.is_temporary = True
             
-            # 3. LLM Extraction
             data = llm_extract_details(l.description, hf_token, model_id)
-            
-            # LLM usually wins but we merge with pre-filter
             l.likely_shared = l.likely_shared or data.get("likely_shared", False)
+            l.is_temporary = l.is_temporary or data.get("is_temporary", False)
             l.furnished = data.get("furnished", l.furnished)
             l.has_kitchen = data.get("has_kitchen", l.has_kitchen)
             l.has_living_room = data.get("has_living_room", l.has_living_room)
             l.has_sofa = data.get("has_sofa", l.has_sofa)
             l.has_washing_machine = data.get("has_washing_machine", l.has_washing_machine)
             l.has_dishwasher = data.get("has_dishwasher", l.has_dishwasher)
-            
             l.price_chf = l.price_chf or parse_price(text)
             l.available_from = parse_date(data.get("available_from")) or parse_date(text)
             l.bedrooms = data.get("bedrooms") or l.bedrooms
             l.total_rooms = data.get("total_rooms") or l.total_rooms
-            
             time.sleep(delay)
         except Exception as e: logger.error(f"Error {l.url}: {e}")
 
 def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    include_unknown = bool(criteria.get("include_unknowns_to_avoid_false_negatives", True))
     reasons = []
     target_date = parse_date(criteria.get("available_on_or_before"))
     if target_date and listing.available_from and listing.available_from > target_date: reasons.append("Date late")
@@ -311,29 +295,35 @@ def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[
     if cur_bed is not None and cur_bed < min_bed: reasons.append("Too few bedrooms")
     if criteria.get("must_be_furnished") and listing.furnished is False: reasons.append("Not furnished")
     if criteria.get("must_have_private_entire_place") and listing.likely_shared: reasons.append("Likely shared")
+    if criteria.get("must_be_indefinite", True) and listing.is_temporary: reasons.append("Temporary/Sublet")
     return len(reasons) == 0, reasons
+
+from urllib.parse import urlencode
 
 def run(config_path: Path):
     cfg = load_config(config_path)
     search_cfg = cfg.get("search", {})
     criteria = cfg.get("criteria", {})
     llm_cfg = cfg.get("llm", {})
-    if not llm_cfg.get("token"):
-        logger.error("Hugging Face token missing in config.yaml under 'llm: token:'")
-        return
+    if not llm_cfg.get("token"): return
     output_dir = Path(search_cfg.get("output_dir", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
     all_listings: List[Listing] = []
     if "flatfox" in search_cfg.get("providers", []):
         ff = search_cfg["flatfox"]
+        base_search_url = ff.get("base_url", "https://flatfox.ch/it/search/")
+        params = ff.get("params", {})
+        search_url = f"{base_search_url}?{urlencode(params)}"
+        
+        logger.info(f"Starting Flatfox search (LLM Mode) ({search_url})...")
         html = None
         try:
-            r = requests.get(ff["search_url"], timeout=20)
+            r = requests.get(search_url, timeout=20)
             html = r.text if not is_challenge_html(r.text) else None
         except Exception: pass
-        if not html: html = fetch_with_playwright(ff["search_url"], ff.get("playwright", {}))
+        if not html: html = fetch_with_playwright(search_url, ff.get("playwright", {}))
         if html:
-            found = parse_listings_from_html(urljoin(ff["search_url"], "/"), html)
+            found = parse_listings_from_html(urljoin(search_url, "/"), html)
             hydrate_details(found, 20, 1.0, llm_cfg)
             all_listings.extend(found)
     
@@ -349,6 +339,12 @@ def run(config_path: Path):
     for l in ordered:
         lines.extend([f"## {l.title}", f"- **Price**: {l.price_chf}", f"- **Distance**: {l.distance_km:.2f} km", f"- [View]({l.url})", ""])
     md_path.write_text("\n".join(lines))
+    
+    excl_path = output_dir / "listings_excluded_llm.md"
+    excl_lines = ["# Excluded (LLM Mode)", ""]
+    for l, r in excluded:
+        excl_lines.extend([f"## {l.title}", f"- **REASONS**: {', '.join(r)}", f"- [View]({l.url})", ""])
+    excl_path.write_text("\n".join(excl_lines))
     logger.info(f"Done. Results in {md_path}")
 
 if __name__ == "__main__":

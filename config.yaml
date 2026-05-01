@@ -2,8 +2,20 @@ search:
   providers:
     - flatfox
   flatfox:
-    # Zurich Search near Europaallee
-    search_url: "https://flatfox.ch/it/search/?east=8.603475&is_furnished=true&is_swap=false&min_rooms=3&north=47.392608&ordering=price_display&place_name=Europaallee%2C%208004%20Zurigo%2C%20Svizzera&place_type=address&query=Europaallee&south=47.358851&take=48&west=8.485409"
+    # Zurich Search parameters
+    base_url: "https://flatfox.ch/it/search/"
+    params:
+      query: "Europaallee"
+      place_name: "Europaallee, 8004 Zurich, Switzerland"
+      north: 47.392608
+      east: 8.603475
+      south: 47.358851
+      west: 8.485409
+      min_rooms: 3
+      is_furnished: "true"
+      is_swap: "false"
+      ordering: "price_display"
+      take: 48
     request_timeout_seconds: 30
     detail_request_delay_seconds: 1.0 # Be gentle to avoid blocks
     use_playwright_fallback: true
@@ -24,9 +36,9 @@ search:
 
 llm:
   # Hugging Face Inference API (Serverless)
-  # Get a free token at https://huggingface.co/settings/tokens
   token: "" 
-  model_id: "mistralai/Mistral-7B-Instruct-v0.2"
+  # DeepSeek-R1 Distill (Thinking Model) - Choosing a size likely to be on serverless
+  model_id: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
 
 criteria:
   center:
@@ -34,6 +46,7 @@ criteria:
   min_bedrooms: 2
   must_be_furnished: true
   must_have_private_entire_place: true # No shared/WG
+  must_be_indefinite: true # Exclude sublets/temporary
   must_have_kitchen: true
   must_have_bathroom: true
   must_have_living_room: true

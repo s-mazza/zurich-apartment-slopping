@@ -532,6 +532,8 @@ def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[
             
     return len(reasons) == 0, reasons
 
+from urllib.parse import urlencode
+
 def run(config_path: Path):
     cfg = load_config(config_path)
     search_cfg = cfg.get("search", {})
@@ -543,11 +545,15 @@ def run(config_path: Path):
     
     if "flatfox" in search_cfg.get("providers", []):
         ff = search_cfg["flatfox"]
-        logger.info("Starting Flatfox search...")
+        base_search_url = ff.get("base_url", "https://flatfox.ch/it/search/")
+        params = ff.get("params", {})
+        search_url = f"{base_search_url}?{urlencode(params)}"
+        
+        logger.info(f"Starting Flatfox search ({search_url})...")
         
         html = None
         try:
-            r = requests.get(ff["search_url"], timeout=ff.get("request_timeout_seconds", 20))
+            r = requests.get(search_url, timeout=ff.get("request_timeout_seconds", 20))
             if not is_challenge_html(r.text):
                 html = r.text
             else:
@@ -556,10 +562,10 @@ def run(config_path: Path):
             logger.warning(f"Direct request failed: {e}")
             
         if not html and ff.get("use_playwright_fallback"):
-            html = fetch_with_playwright(ff["search_url"], ff.get("playwright", {}))
+            html = fetch_with_playwright(search_url, ff.get("playwright", {}))
             
         if html:
-            found = parse_listings_from_html(urljoin(ff["search_url"], "/"), html)
+            found = parse_listings_from_html(urljoin(search_url, "/"), html)
             logger.info(f"Found {len(found)} initial listings.")
             hydrate_details(found, ff.get("request_timeout_seconds", 20), ff.get("detail_request_delay_seconds", 0.5))
             all_listings.extend(found)
