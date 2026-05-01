@@ -2,28 +2,24 @@ search:
   providers:
     - flatfox
   flatfox:
+    # Zurich Search near Europaallee
     search_url: "https://flatfox.ch/it/search/?east=8.603475&is_furnished=true&is_swap=false&min_rooms=3&north=47.392608&ordering=price_display&place_name=Europaallee%2C%208004%20Zurigo%2C%20Svizzera&place_type=address&query=Europaallee&south=47.358851&take=48&west=8.485409"
-    request_timeout_seconds: 20
-    detail_request_delay_seconds: 0.2
+    request_timeout_seconds: 30
+    detail_request_delay_seconds: 1.0 # Be gentle to avoid blocks
     use_playwright_fallback: true
     playwright:
       enabled: true
-      headless: false
-      wait_after_load_seconds: 6
-      challenge_wait_seconds: 20
+      headless: false # Set to true for production, false to debug challenges
+      wait_after_load_seconds: 8
+      challenge_wait_seconds: 25
       manual_continue: true
-      cookies:
-        # Esempio:
-        # - name: "sessionid"
-        #   value: "..."
-        #   domain: ".flatfox.ch"
-        #   path: "/"
-        #   secure: true
-        #   httpOnly: false
-        #   sameSite: "Lax"
-        []
-      extra_headers: {}
       dump_html_path: "output/raw_search_playwright.html"
+      # If blocked, provide cookies from your browser session here:
+      # cookies:
+      #   - name: "sessionid"
+      #     value: "your_value_here"
+      #     domain: ".flatfox.ch"
+      #     path: "/"
   output_dir: "output"
 
 criteria:
@@ -31,13 +27,13 @@ criteria:
     label: "Europaallee, 8004 Zurich"
   min_bedrooms: 2
   must_be_furnished: true
-  must_have_private_entire_place: true
+  must_have_private_entire_place: true # No shared/WG
   must_have_kitchen: true
   must_have_bathroom: true
   must_have_living_room: true
   must_have_sofa: true
   available_on_or_before: "2026-06-15"
-  include_unknowns_to_avoid_false_negatives: true
+  include_unknowns_to_avoid_false_negatives: true # Safer for fuzzy matching
   optional_features:
     - washing_machine
     - dishwasher

@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
 import csv
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -15,16 +15,27 @@ from bs4 import BeautifulSoup
 from dateutil import parser as dt_parser
 from requests import Response
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("apartment_finder.log", encoding="utf-8")
+    ]
+)
+logger = logging.getLogger(__name__)
+
 try:
     from playwright.sync_api import sync_playwright
-except Exception:  # pragma: no cover - optional dependency at runtime
+except Exception:  # pragma: no cover
     sync_playwright = None
 
-
+# Regex patterns
 MONEY_REGEX = re.compile(r"(\d[\d'., ]{2,})")
 DATE_REGEX = re.compile(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})")
 BEDROOM_REGEX = re.compile(
-    r"(?:(\d+)\s*(?:bedroom|bedrooms|schlafzimmer|chambre|camera(?: da letto)?|zimmer))",
+    r"(?:(\d+(?:[.,]\d+)?)\s*(?:bedroom|bedrooms|schlafzimmer|chambre|camera(?: da letto)?|zimmer|stanze da letto))",
     re.IGNORECASE,
 )
 TOTAL_ROOMS_REGEX = re.compile(
@@ -32,32 +43,22 @@ TOTAL_ROOMS_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-
+# Multi-language keyword maps
 NEGATIVE_SHARED = [
-    "wg",
-    "wohngemeinschaft",
-    "shared",
-    "roommate",
-    "colocation",
-    "stanza in appartamento",
-    "sublet room",
-    "single room",
-    "chambre dans",
+    "wg", "wohngemeinschaft", "shared", "roommate", "colocation", 
+    "stanza in appartamento", "sublet room", "single room", "chambre dans",
+    "condiviso", "coabitazione", "mitbewohner"
 ]
 
-POSITIVE_FURNISHED = [
-    "furnished",
-    "möbliert",
-    "mobilato",
-    "ameubl",
-]
-POSITIVE_KITCHEN = ["kitchen", "küche", "cucina", "cuisine"]
-POSITIVE_BATHROOM = ["bathroom", "badzimmer", "bad", "bagno", "salle de bain"]
-POSITIVE_LIVING = ["living room", "wohnzimmer", "salotto", "soggiorno", "séjour"]
-POSITIVE_SOFA = ["sofa", "couch", "canape", "divano"]
-POSITIVE_WASH = ["washing machine", "waschmaschine", "lavatrice", "lave-linge"]
-POSITIVE_DISH = ["dishwasher", "geschirrspüler", "lavastoviglie", "lave-vaisselle"]
-
+KEYWORDS = {
+    "furnished": ["furnished", "möbliert", "mobilato", "ameubl", "arredato", "completo di mobili"],
+    "kitchen": ["kitchen", "küche", "cucina", "cuisine", "angolo cottura", "wohnküche"],
+    "bathroom": ["bathroom", "badzimmer", "bad", "bagno", "salle de bain", "wc", "doccia"],
+    "living": ["living room", "wohnzimmer", "salotto", "soggiorno", "séjour", "area giorno"],
+    "sofa": ["sofa", "couch", "canape", "divano", "poltrona"],
+    "washing_machine": ["washing machine", "waschmaschine", "lavatrice", "lave-linge", "waschturm"],
+    "dishwasher": ["dishwasher", "geschirrspüler", "lavastoviglie", "lave-vaisselle", "spülmaschine"]
+}
 
 @dataclass
 class Listing:
@@ -83,59 +84,54 @@ class Listing:
     raw: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
-
 def load_config(config_path: Path) -> Dict[str, Any]:
-    with config_path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        logger.error(f"Failed to load config from {config_path}: {e}")
+        raise
 
 def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
-
 def parse_price(raw: Any) -> Optional[float]:
-    if raw is None:
-        return None
-    if isinstance(raw, (int, float)):
-        return float(raw)
+    if raw is None: return None
+    if isinstance(raw, (int, float)): return float(raw)
     text = str(raw)
     m = MONEY_REGEX.search(text)
-    if not m:
-        return None
+    if not m: return None
     cleaned = m.group(1).replace("'", "").replace(" ", "")
-    cleaned = cleaned.replace(",", ".") if cleaned.count(",") == 1 and "." not in cleaned else cleaned.replace(",", "")
+    if cleaned.count(",") == 1 and "." not in cleaned:
+        cleaned = cleaned.replace(",", ".")
+    else:
+        cleaned = cleaned.replace(",", "")
     try:
         return float(cleaned)
     except ValueError:
         return None
 
-
 def parse_date(raw: Any) -> Optional[date]:
-    if raw is None:
-        return None
-    if isinstance(raw, date):
-        return raw
+    if raw is None: return None
+    if isinstance(raw, date): return raw
     text = str(raw).strip()
-    if not text:
-        return None
+    if not text: return None
     try:
         return dt_parser.parse(text, dayfirst=True, fuzzy=True).date()
     except Exception:
         m = DATE_REGEX.search(text)
-        if not m:
-            return None
+        if not m: return None
         try:
             return dt_parser.parse(m.group(1), dayfirst=True).date()
         except Exception:
             return None
 
-
-def infer_bool_from_text(text: str, positive_keywords: List[str]) -> Optional[bool]:
+def infer_bool_from_text(text: str, category: str) -> Optional[bool]:
     t = text.lower()
-    if any(k in t for k in positive_keywords):
+    keywords = KEYWORDS.get(category, [])
+    if any(k in t for k in keywords):
         return True
     return None
-
 
 def infer_likely_shared(text: str) -> Optional[bool]:
     t = text.lower()
@@ -143,152 +139,36 @@ def infer_likely_shared(text: str) -> Optional[bool]:
         return True
     return None
 
-
 def infer_bedrooms(text: str) -> Tuple[Optional[float], Optional[float]]:
     m = BEDROOM_REGEX.search(text)
-    bedrooms = float(m.group(1)) if m else None
+    bedrooms = float(m.group(1).replace(",", ".")) if m else None
 
     m2 = TOTAL_ROOMS_REGEX.search(text)
     total_rooms = float(m2.group(1).replace(",", ".")) if m2 else None
     return bedrooms, total_rooms
 
-
 def to_absolute(base_url: str, maybe_url: Optional[str]) -> str:
-    if not maybe_url:
-        return base_url
+    if not maybe_url: return base_url
     return urljoin(base_url, maybe_url)
-
-
-def flatten_ld_json(doc: Any) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    if isinstance(doc, dict):
-        out.append(doc)
-        for v in doc.values():
-            out.extend(flatten_ld_json(v))
-    elif isinstance(doc, list):
-        for x in doc:
-            out.extend(flatten_ld_json(x))
-    return out
-
-
-def try_flatfox_api(base_url: str, query: Dict[str, List[str]], timeout: int) -> List[Dict[str, Any]]:
-    paths = [
-        "/api/v1/public/search/",
-        "/api/v1/public/listings/",
-        "/api/public/search/",
-        "/api/public/listings/",
-    ]
-    headers = {"User-Agent": "Mozilla/5.0 apartment-finder-bot"}
-    for p in paths:
-        url = urljoin(base_url, p)
-        try:
-            r = requests.get(url, params=query, headers=headers, timeout=timeout)
-            if r.status_code >= 400:
-                continue
-            data = r.json()
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                for key in ("results", "objects", "items", "listings"):
-                    if isinstance(data.get(key), list):
-                        return data[key]
-        except Exception:
-            continue
-    return []
-
-
-def has_listing_cues(html: str) -> bool:
-    signal = html.lower()
-    cues = [
-        "/rent/",
-        "/listing/",
-        "/offer/",
-        "price_display",
-        "number_of_rooms",
-        "is_furnished",
-    ]
-    return any(c in signal for c in cues)
-
 
 def is_challenge_html(html: str) -> bool:
     signal = html.lower()
-    # Keep this strict: false positives are worse than missing a weak signal.
     strong_indicators = [
-        "cloudflare",
-        "cf-chl",
-        "captcha",
-        "hcaptcha",
-        "recaptcha",
-        "turnstile",
-        "verify you are human",
-        "attention required",
-        "access denied",
-        "security check",
+        "cloudflare", "cf-chl", "captcha", "hcaptcha", "recaptcha", 
+        "turnstile", "verify you are human", "attention required", 
+        "access denied", "security check"
     ]
     if not any(k in signal for k in strong_indicators):
         return False
-    # If we can already see listing cues, do not treat it as a blocking challenge.
-    return not has_listing_cues(html)
-
-
-def parse_listings_from_html(base_url: str, html: str) -> List[Listing]:
-    listings: List[Listing] = []
-    soup = BeautifulSoup(html, "html.parser")
-
-    for script in soup.select('script[type="application/ld+json"]'):
-        raw = script.get_text(strip=True)
-        if not raw:
-            continue
-        try:
-            doc = json.loads(raw)
-        except Exception:
-            continue
-        for node in flatten_ld_json(doc):
-            if "url" not in node and "name" not in node:
-                continue
-            listing = build_listing_from_ld_json("flatfox", base_url, node)
-            if listing:
-                listings.append(listing)
-
-    if not listings:
-        link_candidates = soup.select('a[href*="/rent/"], a[href*="/listing/"], a[href*="/offer/"], a[href*="/de/"], a[href*="/it/"]')
-        for idx, a in enumerate(link_candidates):
-            href = a.get("href")
-            title = normalize_spaces(a.get_text(" ", strip=True)) or f"Listing {idx+1}"
-            if not href:
-                continue
-            url = to_absolute(base_url, href)
-            listings.append(
-                Listing(
-                    provider="flatfox",
-                    listing_id=str(abs(hash(url))),
-                    title=title,
-                    url=url,
-                    contact_url=url,
-                    price_chf=None,
-                    bedrooms=None,
-                    total_rooms=None,
-                    available_from=None,
-                    furnished=None,
-                    has_kitchen=None,
-                    has_bathroom=None,
-                    has_living_room=None,
-                    has_sofa=None,
-                    has_washing_machine=None,
-                    has_dishwasher=None,
-                    likely_shared=None,
-                    address=None,
-                    description=title,
-                )
-            )
-    return dedupe_listings(listings)
-
+    # If we see actual listing prices or rooms, it's probably not a block
+    cues = ["price_display", "number_of_rooms", "is_furnished", "chf", "rooms"]
+    return not any(c in signal for c in cues)
 
 def fetch_with_playwright(search_url: str, playwright_cfg: Dict[str, Any]) -> Optional[str]:
     if not playwright_cfg.get("enabled", False):
         return None
     if sync_playwright is None:
-        print("[flatfox] Playwright non disponibile. Esegui: pip install -r requirements.txt && playwright install chromium")
+        logger.warning("Playwright not available. Install with: pip install playwright && playwright install chromium")
         return None
 
     headless = bool(playwright_cfg.get("headless", True))
@@ -296,416 +176,282 @@ def fetch_with_playwright(search_url: str, playwright_cfg: Dict[str, Any]) -> Op
     challenge_wait = float(playwright_cfg.get("challenge_wait_seconds", 20))
     manual_continue = bool(playwright_cfg.get("manual_continue", False))
     cookies = playwright_cfg.get("cookies") or []
-    extra_headers = playwright_cfg.get("extra_headers") or {}
     dump_html_path = playwright_cfg.get("dump_html_path")
 
     try:
         with sync_playwright() as p:
+            logger.info(f"Launching browser (headless={headless})...")
             browser = p.chromium.launch(headless=headless)
-            context = browser.new_context(extra_http_headers=extra_headers if isinstance(extra_headers, dict) else None)
-            if isinstance(cookies, list) and cookies:
+            context = browser.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            if cookies:
                 context.add_cookies(cookies)
 
             page = context.new_page()
-            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            logger.info(f"Navigating to {search_url}...")
+            page.goto(search_url, wait_until="networkidle", timeout=60000)
+            
+            # Wait for content or challenge
             page.wait_for_timeout(int(wait_after_load * 1000))
-
+            
             html = page.content()
             if is_challenge_html(html):
-                print(f"[flatfox] Challenge rilevata. Attendo {challenge_wait:.0f}s per eventuale risoluzione automatica.")
+                logger.warning("Bot challenge detected. Waiting for resolution...")
                 page.wait_for_timeout(int(challenge_wait * 1000))
                 if manual_continue and not headless:
-                    input("Risolvi eventuale challenge nel browser, poi premi Invio...")
+                    input("Solve the challenge in the browser, then press Enter here...")
                 html = page.content()
 
             if dump_html_path:
-                dump_path = Path(dump_html_path)
-                dump_path.parent.mkdir(parents=True, exist_ok=True)
-                dump_path.write_text(html, encoding="utf-8")
+                Path(dump_html_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(dump_html_path).write_text(html, encoding="utf-8")
+                logger.info(f"Debug HTML dumped to {dump_html_path}")
 
             browser.close()
             return html
     except Exception as exc:
-        print(f"[flatfox] Errore Playwright: {exc}")
+        logger.error(f"Playwright error: {exc}")
         return None
 
-
-def fetch_flatfox_listings(
-    search_url: str,
-    timeout: int,
-    detail_delay_s: float,
-    use_playwright_fallback: bool = False,
-    playwright_cfg: Optional[Dict[str, Any]] = None,
-) -> List[Listing]:
-    parsed = urlparse(search_url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-    query = parse_qs(parsed.query)
-    headers = {"User-Agent": "Mozilla/5.0 apartment-finder-bot"}
+def parse_listings_from_html(base_url: str, html: str) -> List[Listing]:
     listings: List[Listing] = []
+    soup = BeautifulSoup(html, "html.parser")
 
-    api_items = try_flatfox_api(base_url, query, timeout)
-    if api_items:
-        for item in api_items:
-            listings.append(build_listing_from_api_item("flatfox", base_url, item))
-        return dedupe_listings(listings)
+    # Try Flatfox specific data-json or scripts
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            doc = json.loads(script.get_text(strip=True))
+            # Handle potential list or single object
+            nodes = doc if isinstance(doc, list) else [doc]
+            for node in nodes:
+                if "@type" in node and "Product" in node["@type"] or "Accommodation" in str(node.get("@type")):
+                    l = build_listing_from_ld_json("flatfox", base_url, node)
+                    if l: listings.append(l)
+        except Exception as e:
+            logger.debug(f"Failed to parse LD+JSON: {e}")
 
-    html: Optional[str] = None
-    try:
-        response: Response = requests.get(search_url, headers=headers, timeout=timeout)
-        response.raise_for_status()
-        html = response.text
-    except requests.RequestException as exc:
-        print(f"[flatfox] Errore rete/HTTP sulla pagina ricerca: {exc}")
-
-    if html:
-        listings = parse_listings_from_html(base_url, html)
-        if is_challenge_html(html):
-            print("[flatfox] HTML da requests sembra challenge/anti-bot (segnali forti, senza listing visibili).")
-
-    if (not listings or (html and is_challenge_html(html))) and use_playwright_fallback:
-        pw_html = fetch_with_playwright(search_url, playwright_cfg or {})
-        if pw_html:
-            listings = parse_listings_from_html(base_url, pw_html)
-            if is_challenge_html(pw_html):
-                print("[flatfox] Anche Playwright riceve challenge. Prova cookies reali o headless:false + manual_continue:true.")
-            elif not listings:
-                print("[flatfox] Playwright ha aperto la pagina ma non ho trovato listing parsabili. Salvo HTML di debug.")
-
-    hydrate_flatfox_listing_details(listings, timeout=timeout, delay_s=detail_delay_s)
-    return listings
-
-
-def build_listing_from_api_item(provider: str, base_url: str, item: Dict[str, Any]) -> Listing:
-    title = normalize_spaces(
-        str(
-            item.get("public_title")
-            or item.get("short_title")
-            or item.get("title")
-            or item.get("description_title")
-            or "Untitled listing"
-        )
-    )
-    listing_url = (
-        item.get("short_url")
-        or (item.get("url", {}) or {}).get("default")
-        or item.get("submit_url", {}).get("default")
-        or item.get("url")
-    )
-    if isinstance(listing_url, dict):
-        listing_url = listing_url.get("default")
-    listing_url = to_absolute(base_url, listing_url)
-
-    submit_url = item.get("submit_url", {})
-    contact_url = (
-        (submit_url.get("default") if isinstance(submit_url, dict) else submit_url)
-        or item.get("live_viewing_url")
-        or item.get("website_url")
-        or listing_url
-    )
-    contact_url = to_absolute(base_url, contact_url)
-
-    description = normalize_spaces(str(item.get("description") or ""))
-    full_text = f"{title} {description}"
-    inferred_bed, inferred_total = infer_bedrooms(full_text)
-
-    return Listing(
-        provider=provider,
-        listing_id=str(item.get("pk") or item.get("id") or abs(hash(listing_url))),
-        title=title,
-        url=listing_url,
-        contact_url=contact_url,
-        price_chf=parse_price(item.get("price_display") or item.get("rent_gross") or item.get("rent_net")),
-        bedrooms=parse_float(item.get("bedrooms")) or inferred_bed,
-        total_rooms=parse_float(item.get("number_of_rooms")) or inferred_total,
-        available_from=parse_date(item.get("moving_date") or item.get("available_from")),
-        furnished=bool_or_none(item.get("is_furnished")) or infer_bool_from_text(full_text, POSITIVE_FURNISHED),
-        has_kitchen=infer_bool_from_text(full_text, POSITIVE_KITCHEN),
-        has_bathroom=infer_bool_from_text(full_text, POSITIVE_BATHROOM),
-        has_living_room=infer_bool_from_text(full_text, POSITIVE_LIVING),
-        has_sofa=infer_bool_from_text(full_text, POSITIVE_SOFA),
-        has_washing_machine=infer_bool_from_text(full_text, POSITIVE_WASH),
-        has_dishwasher=infer_bool_from_text(full_text, POSITIVE_DISH),
-        likely_shared=infer_likely_shared(full_text),
-        address=normalize_spaces(
-            str(item.get("public_address") or f"{item.get('street', '')}, {item.get('city', '')}").strip(", ")
-        ),
-        description=description,
-        raw=item,
-    )
-
+    # Fallback to broad link scraping if needed
+    if not listings:
+        logger.info("No LD+JSON listings found, falling back to link scraping.")
+        # This is a bit brittle but better than nothing
+        for a in soup.select('a[href*="/rent/"], a[href*="/listing/"]'):
+            href = a.get("href")
+            if not href: continue
+            url = to_absolute(base_url, href)
+            # Basic stub
+            listings.append(Listing(
+                provider="flatfox", listing_id=str(abs(hash(url))),
+                title=normalize_spaces(a.get_text()), url=url, contact_url=url,
+                price_chf=None, bedrooms=None, total_rooms=None, available_from=None,
+                furnished=None, has_kitchen=None, has_bathroom=None, has_living_room=None,
+                has_sofa=None, has_washing_machine=None, has_dishwasher=None,
+                likely_shared=None, address=None, description=""
+            ))
+    
+    return dedupe_listings(listings)
 
 def build_listing_from_ld_json(provider: str, base_url: str, node: Dict[str, Any]) -> Optional[Listing]:
-    title = normalize_spaces(str(node.get("name") or node.get("headline") or "Untitled listing"))
     url = to_absolute(base_url, node.get("url"))
-    if url == base_url:
-        return None
-    offers = node.get("offers", {})
-    description = normalize_spaces(str(node.get("description") or ""))
-    full_text = f"{title} {description}"
-    inferred_bed, inferred_total = infer_bedrooms(full_text)
-
+    if url == base_url: return None
+    
+    title = normalize_spaces(node.get("name", "Untitled"))
+    desc = normalize_spaces(node.get("description", ""))
+    full_text = f"{title} {desc}"
+    
+    price = None
+    offers = node.get("offers")
+    if isinstance(offers, dict):
+        price = parse_price(offers.get("price"))
+    
+    bed, tot = infer_bedrooms(full_text)
+    
     return Listing(
         provider=provider,
         listing_id=str(node.get("@id") or abs(hash(url))),
         title=title,
         url=url,
         contact_url=url,
-        price_chf=parse_price(offers.get("price") if isinstance(offers, dict) else None),
-        bedrooms=inferred_bed,
-        total_rooms=inferred_total,
-        available_from=None,
-        furnished=infer_bool_from_text(full_text, POSITIVE_FURNISHED),
-        has_kitchen=infer_bool_from_text(full_text, POSITIVE_KITCHEN),
-        has_bathroom=infer_bool_from_text(full_text, POSITIVE_BATHROOM),
-        has_living_room=infer_bool_from_text(full_text, POSITIVE_LIVING),
-        has_sofa=infer_bool_from_text(full_text, POSITIVE_SOFA),
-        has_washing_machine=infer_bool_from_text(full_text, POSITIVE_WASH),
-        has_dishwasher=infer_bool_from_text(full_text, POSITIVE_DISH),
+        price_chf=price,
+        bedrooms=bed,
+        total_rooms=tot,
+        available_from=parse_date(full_text), # Try to find date in text if not explicit
+        furnished=infer_bool_from_text(full_text, "furnished"),
+        has_kitchen=infer_bool_from_text(full_text, "kitchen"),
+        has_bathroom=infer_bool_from_text(full_text, "bathroom"),
+        has_living_room=infer_bool_from_text(full_text, "living"),
+        has_sofa=infer_bool_from_text(full_text, "sofa"),
+        has_washing_machine=infer_bool_from_text(full_text, "washing_machine"),
+        has_dishwasher=infer_bool_from_text(full_text, "dishwasher"),
         likely_shared=infer_likely_shared(full_text),
-        address=normalize_spaces(str(node.get("address") or "")),
-        description=description,
-        raw=node,
+        address=normalize_spaces(str(node.get("address", ""))),
+        description=desc,
+        raw=node
     )
 
-
 def dedupe_listings(listings: List[Listing]) -> List[Listing]:
-    by_url: Dict[str, Listing] = {}
+    seen = {}
     for l in listings:
-        if l.url not in by_url:
-            by_url[l.url] = l
-    return list(by_url.values())
+        if l.url not in seen:
+            seen[l.url] = l
+    return list(seen.values())
 
-
-def hydrate_flatfox_listing_details(listings: List[Listing], timeout: int, delay_s: float) -> None:
-    headers = {"User-Agent": "Mozilla/5.0 apartment-finder-bot"}
-    for listing in listings:
+def hydrate_details(listings: List[Listing], timeout: int, delay: float):
+    logger.info(f"Hydrating details for {len(listings)} listings...")
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    for l in listings:
         try:
-            r = requests.get(listing.url, headers=headers, timeout=timeout)
+            logger.debug(f"Fetching details for: {l.url}")
+            r = requests.get(l.url, headers=headers, timeout=timeout)
             if r.status_code >= 400:
+                logger.warning(f"Failed to fetch {l.url}: HTTP {r.status_code}")
                 continue
+            
             soup = BeautifulSoup(r.text, "html.parser")
             text = normalize_spaces(soup.get_text(" ", strip=True))
-            listing.description = normalize_spaces(f"{listing.description} {text}")[:3000]
-
-            if listing.price_chf is None:
-                listing.price_chf = parse_price(text)
-            if listing.available_from is None:
-                listing.available_from = parse_date(text)
-            if listing.bedrooms is None or listing.total_rooms is None:
-                b, t = infer_bedrooms(text)
-                listing.bedrooms = listing.bedrooms or b
-                listing.total_rooms = listing.total_rooms or t
-            listing.furnished = listing.furnished or infer_bool_from_text(text, POSITIVE_FURNISHED)
-            listing.has_kitchen = listing.has_kitchen or infer_bool_from_text(text, POSITIVE_KITCHEN)
-            listing.has_bathroom = listing.has_bathroom or infer_bool_from_text(text, POSITIVE_BATHROOM)
-            listing.has_living_room = listing.has_living_room or infer_bool_from_text(text, POSITIVE_LIVING)
-            listing.has_sofa = listing.has_sofa or infer_bool_from_text(text, POSITIVE_SOFA)
-            listing.has_washing_machine = listing.has_washing_machine or infer_bool_from_text(text, POSITIVE_WASH)
-            listing.has_dishwasher = listing.has_dishwasher or infer_bool_from_text(text, POSITIVE_DISH)
-            listing.likely_shared = listing.likely_shared or infer_likely_shared(text)
-
-            contact_link = soup.select_one('a[href*="mailto:"], a[href*="/contact"], a[href*="submit"]')
-            if contact_link and contact_link.get("href"):
-                listing.contact_url = to_absolute(listing.url, contact_link.get("href"))
-            time.sleep(delay_s)
-        except Exception as exc:
-            listing.warnings.append(f"detail_fetch_failed: {exc}")
-
-
-def parse_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(str(value).replace(",", "."))
-    except Exception:
-        return None
-
-
-def bool_or_none(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    return None
-
+            l.description = text[:5000] # Cap description size
+            
+            # Update fields if missing
+            l.price_chf = l.price_chf or parse_price(text)
+            l.available_from = l.available_from or parse_date(text)
+            b, t = infer_bedrooms(text)
+            l.bedrooms = l.bedrooms or b
+            l.total_rooms = l.total_rooms or t
+            
+            for cat in KEYWORDS:
+                field_name = f"has_{cat}" if cat not in ["furnished", "sofa"] else cat
+                if cat == "furnished": field_name = "furnished"
+                if cat == "sofa": field_name = "has_sofa"
+                if cat == "living": field_name = "has_living_room"
+                
+                current_val = getattr(l, field_name)
+                if current_val is None:
+                    setattr(l, field_name, infer_bool_from_text(text, cat))
+            
+            if l.likely_shared is None:
+                l.likely_shared = infer_likely_shared(text)
+            
+            # Look for contact button/link
+            contact_btn = soup.select_one('a[href*="/contact"], a[href*="mailto:"], button[data-href*="contact"]')
+            if contact_btn:
+                l.contact_url = to_absolute(l.url, contact_btn.get("href") or contact_btn.get("data-href"))
+            
+            time.sleep(delay)
+        except Exception as e:
+            logger.error(f"Error hydrating {l.url}: {e}")
+            l.warnings.append(f"hydration_error: {e}")
 
 def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> bool:
     include_unknown = bool(criteria.get("include_unknowns_to_avoid_false_negatives", True))
-
+    
+    # Date filter
     target_date = parse_date(criteria.get("available_on_or_before"))
-    min_bedrooms = float(criteria.get("min_bedrooms", 2))
-
-    if target_date:
-        if listing.available_from and listing.available_from > target_date:
+    if target_date and listing.available_from:
+        if listing.available_from > target_date:
+            logger.debug(f"Excluded {listing.listing_id}: Available from {listing.available_from} > {target_date}")
             return False
-        if not listing.available_from and not include_unknown:
-            return False
-
-    inferred_bedrooms = listing.bedrooms
-    if inferred_bedrooms is None and listing.total_rooms is not None:
-        inferred_bedrooms = max(1.0, listing.total_rooms - 1.0)
-    if inferred_bedrooms is not None and inferred_bedrooms < min_bedrooms:
-        return False
-    if inferred_bedrooms is None and not include_unknown:
+    elif target_date and not include_unknown:
         return False
 
-    if criteria.get("must_be_furnished", True):
-        if listing.furnished is False:
-            return False
-        if listing.furnished is None and not include_unknown:
-            return False
+    # Bedrooms filter
+    min_bed = float(criteria.get("min_bedrooms", 2))
+    current_bed = listing.bedrooms
+    if current_bed is None and listing.total_rooms:
+        current_bed = max(1.0, listing.total_rooms - 1.0) # Heuristic
+    
+    if current_bed is not None and current_bed < min_bed:
+        logger.debug(f"Excluded {listing.listing_id}: {current_bed} bedrooms < {min_bed}")
+        return False
+    elif current_bed is None and not include_unknown:
+        return False
 
-    if criteria.get("must_have_private_entire_place", True):
-        if listing.likely_shared is True:
+    # Boolean flags
+    filters = [
+        ("must_be_furnished", "furnished"),
+        ("must_have_private_entire_place", "likely_shared", True), # negate
+        ("must_have_kitchen", "has_kitchen"),
+        ("must_have_bathroom", "has_bathroom"),
+        ("must_have_living_room", "has_living_room"),
+        ("must_have_sofa", "has_sofa"),
+    ]
+    
+    for crit_key, field_name, *negate in filters:
+        required = criteria.get(crit_key, False)
+        if not required: continue
+        
+        val = getattr(listing, field_name)
+        is_negated = negate[0] if negate else False
+        
+        actual_val = not val if is_negated and val is not None else val
+        
+        if actual_val is False:
+            logger.debug(f"Excluded {listing.listing_id}: Failed {crit_key} (val={val})")
             return False
-        if listing.likely_shared is None and not include_unknown:
+        if val is None and not include_unknown:
             return False
-
-    for field_name, criterion_key in [
-        ("has_kitchen", "must_have_kitchen"),
-        ("has_bathroom", "must_have_bathroom"),
-        ("has_living_room", "must_have_living_room"),
-        ("has_sofa", "must_have_sofa"),
-    ]:
-        required = bool(criteria.get(criterion_key, True))
-        value = getattr(listing, field_name)
-        if required and value is False:
-            return False
-        if required and value is None and not include_unknown:
-            return False
-
+            
     return True
 
-
-def annotate_uncertainties(listing: Listing) -> List[str]:
-    flags = []
-    if listing.available_from is None:
-        flags.append("available_from_unknown")
-    if listing.bedrooms is None and listing.total_rooms is None:
-        flags.append("bedrooms_unknown")
-    if listing.furnished is None:
-        flags.append("furnished_not_explicit")
-    if listing.has_kitchen is None:
-        flags.append("kitchen_not_explicit")
-    if listing.has_living_room is None:
-        flags.append("living_room_not_explicit")
-    if listing.has_sofa is None:
-        flags.append("sofa_not_explicit")
-    return flags
-
-
-def export_results(listings: List[Listing], output_dir: Path, message_template_path: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    rows = []
-    for l in listings:
-        rows.append(
-            {
-                "provider": l.provider,
-                "listing_id": l.listing_id,
-                "title": l.title,
-                "price_chf": l.price_chf if l.price_chf is not None else "",
-                "bedrooms": l.bedrooms if l.bedrooms is not None else "",
-                "total_rooms": l.total_rooms if l.total_rooms is not None else "",
-                "available_from": l.available_from.isoformat() if l.available_from else "",
-                "furnished": l.furnished,
-                "has_kitchen": l.has_kitchen,
-                "has_bathroom": l.has_bathroom,
-                "has_living_room": l.has_living_room,
-                "has_sofa": l.has_sofa,
-                "has_washing_machine": l.has_washing_machine,
-                "has_dishwasher": l.has_dishwasher,
-                "address": l.address or "",
-                "listing_url": l.url,
-                "contact_url": l.contact_url,
-                "uncertainties": "|".join(annotate_uncertainties(l)),
-            }
-        )
-
-    csv_path = output_dir / "listings_filtered.csv"
-    if rows:
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-
-    md_path = output_dir / "listings_filtered.md"
-    message_template = ""
-    if message_template_path.exists():
-        message_template = message_template_path.read_text(encoding="utf-8").strip()
-
-    lines = ["# Appartamenti idonei (ordinati per prezzo decrescente)", ""]
-    for i, l in enumerate(listings, 1):
-        price = f"CHF {l.price_chf:,.0f}".replace(",", "'") if l.price_chf is not None else "Prezzo non trovato"
-        available = l.available_from.isoformat() if l.available_from else "Data non esplicita"
-        uncertain = ", ".join(annotate_uncertainties(l)) or "nessuna"
-        lines.extend(
-            [
-                f"## {i}. {l.title}",
-                f"- Prezzo: {price}",
-                f"- Camere da letto stimate: {l.bedrooms if l.bedrooms is not None else 'n/d'}",
-                f"- Locali totali: {l.total_rooms if l.total_rooms is not None else 'n/d'}",
-                f"- Disponibile da: {available}",
-                f"- Arredato: {l.furnished}",
-                f"- Lavatrice: {l.has_washing_machine}",
-                f"- Lavastoviglie: {l.has_dishwasher}",
-                f"- Incertezze estrazione: {uncertain}",
-                f"- Annuncio: [{l.url}]({l.url})",
-                f"- Contatta con 1 click: [{l.contact_url}]({l.contact_url})",
-                "",
-            ]
-        )
-    md_path.write_text("\n".join(lines), encoding="utf-8")
-
-    contact_path = output_dir / "quick_contact_message.txt"
-    contact_path.write_text(message_template, encoding="utf-8")
-
-
-def sort_by_price_desc(listings: List[Listing]) -> List[Listing]:
-    return sorted(listings, key=lambda x: (x.price_chf is not None, x.price_chf or -1), reverse=True)
-
-
-def run(config_path: Path) -> int:
+def run(config_path: Path):
     cfg = load_config(config_path)
     search_cfg = cfg.get("search", {})
     criteria = cfg.get("criteria", {})
     output_dir = Path(search_cfg.get("output_dir", "output"))
-    providers = search_cfg.get("providers", [])
-
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     all_listings: List[Listing] = []
+    
+    if "flatfox" in search_cfg.get("providers", []):
+        ff = search_cfg["flatfox"]
+        logger.info("Starting Flatfox search...")
+        
+        html = None
+        # Try direct requests first (fast)
+        try:
+            r = requests.get(ff["search_url"], timeout=ff.get("request_timeout_seconds", 20))
+            if not is_challenge_html(r.text):
+                html = r.text
+            else:
+                logger.info("Direct request blocked by anti-bot, trying Playwright...")
+        except Exception as e:
+            logger.warning(f"Direct request failed: {e}")
+            
+        if not html and ff.get("use_playwright_fallback"):
+            html = fetch_with_playwright(ff["search_url"], ff.get("playwright", {}))
+            
+        if html:
+            found = parse_listings_from_html(urljoin(ff["search_url"], "/"), html)
+            logger.info(f"Found {len(found)} initial listings.")
+            hydrate_details(found, ff.get("request_timeout_seconds", 20), ff.get("detail_request_delay_seconds", 0.5))
+            all_listings.extend(found)
+        else:
+            logger.error("Could not retrieve search page.")
 
-    if "flatfox" in providers:
-        ff = search_cfg.get("flatfox", {})
-        search_url = ff["search_url"]
-        timeout = int(ff.get("request_timeout_seconds", 20))
-        detail_delay = float(ff.get("detail_request_delay_seconds", 0.2))
-        use_playwright_fallback = bool(ff.get("use_playwright_fallback", False))
-        playwright_cfg = ff.get("playwright", {})
-        all_listings.extend(
-            fetch_flatfox_listings(
-                search_url,
-                timeout=timeout,
-                detail_delay_s=detail_delay,
-                use_playwright_fallback=use_playwright_fallback,
-                playwright_cfg=playwright_cfg,
-            )
-        )
-
+    # Filtering
     filtered = [l for l in all_listings if listing_passes_filters(l, criteria)]
-    ordered = sort_by_price_desc(filtered)
-
-    message_path = Path(cfg.get("contact", {}).get("message_template_path", "message_template.txt"))
-    export_results(ordered, output_dir, message_path)
-
-    print(f"Listings trovati: {len(all_listings)}")
-    print(f"Listings idonei: {len(ordered)}")
-    print(f"Output: {output_dir.resolve()}")
-    if len(all_listings) == 0:
-        print(
-            "Nessun annuncio recuperato. Se dal tuo PC Flatfox richiede login/sessione, posso integrare i cookie "
-            "del browser nella configurazione per fare richieste autenticate."
-        )
-    return 0
-
+    # Sorting
+    ordered = sorted(filtered, key=lambda x: (x.price_chf or 999999), reverse=True)
+    
+    logger.info(f"Total: {len(all_listings)}, Filtered: {len(ordered)}")
+    
+    # Export
+    md_path = output_dir / "listings_filtered.md"
+    lines = ["# Zurich Apartment Search Results", f"Generated on {date.today()}", ""]
+    for i, l in enumerate(ordered, 1):
+        price = f"CHF {l.price_chf:,.0f}" if l.price_chf else "Unknown"
+        lines.extend([
+            f"## {i}. {l.title}",
+            f"- **Price**: {price}",
+            f"- **Bedrooms**: {l.bedrooms or 'n/a'} (Total rooms: {l.total_rooms or 'n/a'})",
+            f"- **Available**: {l.available_from or 'Unknown'}",
+            f"- **Furnished**: {l.furnished}",
+            f"- **Address**: {l.address or 'See listing'}",
+            f"- **Features**: Kitchen: {l.has_kitchen}, Living: {l.has_living_room}, Sofa: {l.has_sofa}",
+            f"- **Optional**: Wash: {l.has_washing_machine}, Dish: {l.has_dishwasher}",
+            f"- [View Listing]({l.url})",
+            f"- [**Contact with 1 Click**]({l.contact_url})",
+            ""
+        ])
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info(f"Results exported to {md_path}")
 
 if __name__ == "__main__":
-    config_arg = Path("config.yaml")
-    raise SystemExit(run(config_arg))
+    run(Path("config.yaml"))
