@@ -22,6 +22,12 @@ search:
       #     path: "/"
   output_dir: "output"
 
+llm:
+  # Hugging Face Inference API (Serverless)
+  # Get a free token at https://huggingface.co/settings/tokens
+  token: "" 
+  model_id: "mistralai/Mistral-7B-Instruct-v0.2"
+
 criteria:
   center:
     label: "Europaallee, 8004 Zurich"
