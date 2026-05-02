@@ -1,3 +1,8 @@
 .venv/
 **/__pycache__/
 output/
+*.log
+cookies_homegate.txt
+debug_*.py
+*.json
+*.html
