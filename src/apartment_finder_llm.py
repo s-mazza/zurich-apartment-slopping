@@ -74,6 +74,8 @@ class Listing:
     lat: Optional[float] = None
     lon: Optional[float] = None
     distance_km: Optional[float] = None
+    travel_time_pt_min: Optional[int] = None # Public Transport
+    walking_time_min: Optional[int] = None # Walking
     raw: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -154,6 +156,54 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
         math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
+
+def get_swiss_transport_time(from_lat, from_lon, to_lat, to_lon) -> Optional[int]:
+    """Get commute time using public transport (transport.opendata.ch)"""
+    if from_lat is None or from_lon is None: return None
+    url = "https://transport.opendata.ch/v1/connections"
+    params = {
+        "from": f"{from_lat},{from_lon}",
+        "to": f"{to_lat},{to_lon}",
+        "limit": 1
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("connections"):
+                duration_str = data["connections"][0]["duration"]
+                match = re.search(r'(\d+)d(\d{2}):(\d{2}):(\d{2})', duration_str)
+                if match:
+                    d, h, m, s = map(int, match.groups())
+                    return d * 1440 + h * 60 + m
+    except Exception as e:
+        logger.debug(f"Swiss Transport API error: {e}")
+    return None
+
+def get_google_maps_times(from_lat, from_lon, to_lat, to_lon, api_key: str) -> Tuple[Optional[int], Optional[int]]:
+    """Get walking and transit times via Google Maps API"""
+    if not api_key or from_lat is None or from_lon is None: return None, None
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    
+    times = {}
+    for mode in ["walking", "transit"]:
+        params = {
+            "origins": f"{from_lat},{from_lon}",
+            "destinations": f"{to_lat},{to_lon}",
+            "mode": mode,
+            "key": api_key
+        }
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if data["rows"][0]["elements"][0]["status"] == "OK":
+                    duration_sec = data["rows"][0]["elements"][0]["duration"]["value"]
+                    times[mode] = round(duration_sec / 60)
+        except Exception as e:
+            logger.debug(f"Google Maps API error ({mode}): {e}")
+            
+    return times.get("transit"), times.get("walking")
 
 def extract_coords(html: str) -> Tuple[Optional[float], Optional[float]]:
     m = re.search(r'north=([\d.]+)&amp;east=([\d.]+)&amp;south=([\d.]+)&amp;west=([\d.]+)', html)
@@ -315,30 +365,23 @@ def parse_listings_from_html_homegate(base_url: str, html: str) -> Tuple[List[Li
             
     if json_data:
         try:
-            # Homegate verification: resultList.search.fullSearch.result
             res_obj = _find_key_recursive(json_data, "result") or {}
             items = res_obj.get("listings", [])
             has_next = res_obj.get("hasNextPage", False)
             total_results = res_obj.get("resultCount", 0)
-
-            if not items: # Fallback to broader result find
+            if not items:
                 items = _find_homegate_results(json_data)
 
             for item in items:
                 listing_data = item.get("listing") or item
                 id_ = item.get("id") or listing_data.get("id") or listing_data.get("listingId")
                 if not id_ or not str(id_).isdigit(): continue
-                
                 url = urljoin(base_url, f"/rent/{id_}")
-                
-                # Nested data mapping
                 prices = listing_data.get("prices", {})
                 price_val = prices.get("rent", {}).get("gross") or prices.get("rent", {}).get("net") or listing_data.get("price")
                 price = parse_price(price_val)
-                
                 chars = listing_data.get("characteristics", {})
                 rooms = chars.get("totalRooms") or listing_data.get("rooms")
-                
                 addr = listing_data.get("address", {})
                 geo = addr.get("geoCoordinates") or addr.get("geo") or _find_key_recursive(item, "geoCoordinates")
                 lat, lon = None, None
@@ -360,7 +403,6 @@ def parse_listings_from_html_homegate(base_url: str, html: str) -> Tuple[List[Li
         except Exception as e:
             logger.debug(f"Homegate JSON mapping failed: {e}")
 
-    # Final Link fallback
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.select('a[href*="/rent/"], a[href*="/mieten/"]'):
         href = a.get("href")
@@ -378,150 +420,97 @@ def parse_listings_from_html_homegate(base_url: str, html: str) -> Tuple[List[Li
         ))
     return list({l.url: l for l in listings}.values()), False, len(listings)
 
+def parse_listings_from_html_comparis(base_url: str, html: str) -> Tuple[List[Listing], bool, int]:
+    listings: List[Listing] = []
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.select_one('script#__NEXT_DATA__')
+    if tag:
+        try:
+            data = json.loads(tag.get_text())
+            res_data = data.get("props", {}).get("pageProps", {}).get("initialResultData", {})
+            items = res_data.get("resultItems", [])
+            found_ids = set()
+            for item in items:
+                id_ = item.get("AdId")
+                if not id_: continue
+                found_ids.add(str(id_))
+                url = urljoin(base_url, f"/immobilien/marktplatz/details/show/{id_}")
+                price = parse_price(item.get("PriceValue") or item.get("Price"))
+                title = item.get("Title", "Comparis Listing")
+                addr_parts = item.get("Address", [])
+                address = ", ".join(addr_parts) if isinstance(addr_parts, list) else str(addr_parts)
+                rooms = None
+                for info in item.get("EssentialInformation", []):
+                    if "Zimmer" in info:
+                        m = re.search(r'(\d+(?:\.\d+)?)', info)
+                        if m: rooms = float(m.group(1))
+                listings.append(Listing(
+                    provider="comparis", listing_id=str(id_),
+                    title=title, url=url, contact_url=url,
+                    price_chf=price, total_rooms=rooms, address=address,
+                    description=title
+                ))
+            all_ids = res_data.get("adIds", [])
+            for ad_id in all_ids:
+                sid = str(ad_id)
+                if sid in found_ids: continue
+                url = urljoin(base_url, f"/immobilien/marktplatz/details/show/{ad_id}")
+                listings.append(Listing(
+                    provider="comparis", listing_id=sid,
+                    title=f"Comparis Listing {sid}", url=url, contact_url=url,
+                    description=""
+                ))
+            return listings, False, len(all_ids)
+        except Exception as e:
+            logger.debug(f"Comparis mapping failed: {e}")
+    return [], False, 0
+
 def llm_extract_details(description: str, hf_token: str, model_id: str) -> Dict[str, Any]:
     if not hf_token: return {}
     trimmed_desc = description[:2500]
     prompt = f"""[INST] Task: Analyze this Zurich apartment listing and extract data.
-Determine if it is a shared apartment (WG/roommate) or entire place.
-Check carefully if it is a 'temporary' rental (sublet, 'befristet', 'Untermiete').
-
-JSON Keys required:
-- furnished (bool)
-- has_kitchen (bool)
-- has_bathroom (bool)
-- has_living_room (bool)
-- has_sofa (bool)
-- has_washing_machine (bool)
-- has_dishwasher (bool)
-- likely_shared (bool)
-- is_temporary (bool)
-- bedrooms (float)
-- total_rooms (float)
-- available_from (YYYY-MM-DD or null)
-
-Description:
-{trimmed_desc}
-
-Output ONLY the JSON object. [/INST]"""
+JSON Keys: furnished (bool), has_kitchen (bool), has_bathroom (bool), has_living_room (bool), has_sofa (bool), has_washing_machine (bool), has_dishwasher (bool), likely_shared (bool), is_temporary (bool), bedrooms (float), total_rooms (float), available_from (YYYY-MM-DD). Output ONLY JSON.[/INST]\n\nDescription:\n{trimmed_desc}"""
     headers = {"Authorization": f"Bearer {hf_token}"}
     api_url = f"https://api-inference.huggingface.co/models/{model_id}"
     try:
-        payload = {
-            "inputs": prompt, 
-            "parameters": {"return_full_text": False, "temperature": 0.1, "max_new_tokens": 1500},
-            "options": {"wait_for_model": True}
-        }
-        response = requests.post(api_url, headers=headers, json=payload, timeout=90)
-        if response.status_code != 200: return {}
-        res_json = response.json()
-        raw_text = res_json[0].get("generated_text", "") if isinstance(res_json, list) else res_json.get("generated_text", "")
-        clean_text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL).strip()
+        payload = {"inputs": prompt, "parameters": {"return_full_text": False, "temperature": 0.1, "max_new_tokens": 1500}, "options": {"wait_for_model": True}}
+        r = requests.post(api_url, headers=headers, json=payload, timeout=90)
+        if r.status_code != 200: return {}
+        clean_text = re.sub(r'<think>.*?</think>', '', r.json()[0].get("generated_text", ""), flags=re.DOTALL).strip()
         json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
         return json.loads(json_match.group(0)) if json_match else {}
     except Exception: return {}
 
-def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    include_unknown = bool(criteria.get("include_unknowns_to_avoid_false_negatives", True))
-    reasons = []
-    
-    # Price filter
-    max_price = criteria.get("max_price")
-    if max_price and listing.price_chf:
-        if listing.price_chf > float(max_price):
-            reasons.append(f"Price CHF {listing.price_chf} > {max_price}")
-    elif max_price and not include_unknown and listing.price_chf is None:
-        reasons.append("Price unknown")
-
-    # Date filter
-    target_date = parse_date(criteria.get("available_on_or_before"))
-    if target_date:
-        if listing.available_from:
-            if listing.available_from > target_date:
-                reasons.append(f"Date late ({listing.available_from})")
-        elif not include_unknown:
-            reasons.append("Date unknown")
-
-    # Bedrooms filter
-    min_bed = float(criteria.get("min_bedrooms", 2))
-    cur_bed = listing.bedrooms or (max(1.0, listing.total_rooms - 1.0) if listing.total_rooms else None)
-    if cur_bed is not None:
-        if cur_bed < min_bed:
-            reasons.append(f"Too few bedrooms ({cur_bed})")
-    elif not include_unknown:
-        reasons.append("Bedrooms unknown")
-
-    # Boolean flags
-    checks = [
-        ("must_be_furnished", "furnished", "Not furnished"),
-        ("must_have_private_entire_place", "likely_shared", "Likely shared", True), # negate
-        ("must_be_indefinite", "is_temporary", "Temporary/Sublet", True) # negate
-    ]
-    
-    for crit_key, field_name, error_msg, *negate in checks:
-        required = criteria.get(crit_key, False)
-        if not required: continue
-        
-        val = getattr(listing, field_name)
-        is_negated = negate[0] if negate else False
-        
-        if val is None:
-            if not include_unknown:
-                reasons.append(f"{error_msg} (unknown)")
-            continue
-            
-        actual_val = not val if is_negated else val
-        if actual_val is False:
-            reasons.append(error_msg)
-            
-    return len(reasons) == 0, reasons
-
-def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg: Dict[str, Any]):
+def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg: Dict[str, Any], google_key: str = ""):
     SHARED_KEYWORDS = ["mitbewohner", "wg-zimmer", "wohngemeinschaft", "shared flat", "stanza in", "roommate", "coloc"]
     TEMP_KEYWORDS = ["befristet", "untermiete", "sublet", "temporary", "short term", "fino al", "bis zum"]
     total = len(listings)
     hf_token = llm_cfg.get("token")
     model_id = llm_cfg.get("model_id")
     logger.info(f"Hydrating {total} listings via Hybrid LLM...")
-    
     for idx, l in enumerate(listings, 1):
         try:
             logger.info(f"[{idx}/{total}] Processing ({l.provider}): {l.title[:30]}...")
-            
-            # Try to catch obvious shared/temp from title first
-            desc_lower = l.title.lower()
+            if l.description == "" or l.lat is None:
+                try:
+                    r = requests.get(l.url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+                    if r.status_code < 400:
+                        soup = BeautifulSoup(r.text, "html.parser")
+                        for s in soup(["script", "style"]): s.decompose()
+                        l.description = normalize_spaces(soup.get_text(" ", strip=True))[:4000]
+                        if l.lat is None: l.lat, l.lon = extract_coords(r.text)
+                except Exception: pass
+            if l.lat and l.lon:
+                l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
+                l.travel_time_pt_min = get_swiss_transport_time(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
+                if google_key:
+                    pt, walk = get_google_maps_times(l.lat, l.lon, OFFICE_LAT, OFFICE_LON, google_key)
+                    l.travel_time_pt_min = pt or l.travel_time_pt_min
+                    l.walking_time_min = walk
+            desc_lower = l.description.lower() or l.title.lower()
             if any(k in desc_lower for k in SHARED_KEYWORDS): l.likely_shared = True
             if any(k in desc_lower for k in TEMP_KEYWORDS): l.is_temporary = True
-
-            # Try to fetch detail page
-            r = None
-            try:
-                r = requests.get(l.url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}, timeout=timeout)
-                if r.status_code >= 400:
-                    logger.debug(f"Detail fetch failed with {r.status_code} for {l.url}")
-                    r = None
-            except Exception: r = None
-
-            if r:
-                soup = BeautifulSoup(r.text, "html.parser")
-                for s in soup(["script", "style"]): s.decompose()
-                text = normalize_spaces(soup.get_text(" ", strip=True))
-                l.description = text[:4000]
-                if l.lat is None:
-                    l.lat, l.lon = extract_coords(r.text)
-                    if l.lat and l.lon: l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
-            else:
-                # If detail page fails, use the title for LLM inference as a last resort
-                l.description = l.title
-            
-            # Update keywords from description if we got it
-            desc_lower = l.description.lower()
-            if any(k in desc_lower for k in SHARED_KEYWORDS): l.likely_shared = True
-            if any(k in desc_lower for k in TEMP_KEYWORDS): l.is_temporary = True
-            
-            # Use LLM (either on full desc or just title)
-            data = llm_extract_details(l.description, hf_token, model_id)
-            
-            # Merge data
+            data = llm_extract_details(l.description if l.description else l.title, hf_token, model_id)
             l.likely_shared = l.likely_shared or data.get("likely_shared", False)
             l.is_temporary = l.is_temporary or data.get("is_temporary", False)
             l.furnished = data.get("furnished", l.furnished)
@@ -530,93 +519,33 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg
             l.has_sofa = data.get("has_sofa", l.has_sofa)
             l.has_washing_machine = data.get("has_washing_machine", l.has_washing_machine)
             l.has_dishwasher = data.get("has_dishwasher", l.has_dishwasher)
-            
-            # Only update price/date if not already set by structured search result
-            if l.price_chf is None: l.price_chf = parse_price(l.description)
-            if l.available_from is None:
-                l.available_from = parse_date(data.get("available_from")) or parse_date(l.description)
-            if l.bedrooms is None:
-                l.bedrooms = data.get("bedrooms")
-            
+            if l.price_chf is None: l.price_chf = parse_price(l.description if l.description else l.title)
+            if l.available_from is None: l.available_from = parse_date(data.get("available_from")) or parse_date(l.description)
+            if l.bedrooms is None: l.bedrooms = data.get("bedrooms")
             time.sleep(delay)
         except Exception as e: logger.error(f"Error {l.url}: {e}")
 
-def parse_listings_from_html_comparis(base_url: str, html: str) -> Tuple[List[Listing], bool, int]:
-    listings: List[Listing] = []
-    soup = BeautifulSoup(html, "html.parser")
-    
-    tag = soup.select_one('script#__NEXT_DATA__')
-    if tag:
-        try:
-            data = json.loads(tag.get_text())
-            res_data = data.get("props", {}).get("pageProps", {}).get("initialResultData", {})
-            
-            # 1. Map the full items provided in the first page (usually 10)
-            items = res_data.get("resultItems", [])
-            found_ids = set()
-            for item in items:
-                id_ = item.get("AdId")
-                if not id_: continue
-                found_ids.add(str(id_))
-                
-                url = urljoin(base_url, f"/immobilien/marktplatz/details/show/{id_}")
-                price = parse_price(item.get("PriceValue") or item.get("Price"))
-                title = item.get("Title", "Comparis Listing")
-                addr_parts = item.get("Address", [])
-                address = ", ".join(addr_parts) if isinstance(addr_parts, list) else str(addr_parts)
-                
-                rooms = None
-                for info in item.get("EssentialInformation", []):
-                    if "Zimmer" in info:
-                        m = re.search(r'(\d+(?:\.\d+)?)', info)
-                        if m: rooms = float(m.group(1))
+def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    include_unknown = bool(criteria.get("include_unknowns_to_avoid_false_negatives", True))
+    reasons = []
+    max_price = criteria.get("max_price")
+    if max_price and listing.price_chf and listing.price_chf > float(max_price): reasons.append(f"Price CHF {listing.price_chf} > {max_price}")
+    target_date = parse_date(criteria.get("available_on_or_before"))
+    if target_date and listing.available_from and listing.available_from > target_date: reasons.append("Date late")
+    min_bed = float(criteria.get("min_bedrooms", 2))
+    cur_bed = listing.bedrooms or (max(1.0, listing.total_rooms - 1.0) if listing.total_rooms else None)
+    if cur_bed is not None and cur_bed < min_bed: reasons.append(f"Too few bedrooms ({cur_bed})")
+    if criteria.get("must_be_furnished") and listing.furnished is False: reasons.append("Not furnished")
+    if criteria.get("must_have_private_entire_place") and listing.likely_shared: reasons.append("Likely shared")
+    if criteria.get("must_be_indefinite", True) and listing.is_temporary: reasons.append("Temporary/Sublet")
+    return len(reasons) == 0, reasons
 
-                listings.append(Listing(
-                    provider="comparis", listing_id=str(id_),
-                    title=title, url=url, contact_url=url,
-                    price_chf=price, total_rooms=rooms, address=address,
-                    description=title
-                ))
-            
-            # 2. Extract ALL IDs (the user sees 400+, we found 453 in the JSON)
-            all_ids = res_data.get("adIds", [])
-            for ad_id in all_ids:
-                sid = str(ad_id)
-                if sid in found_ids: continue
-                
-                # Create stubs for the remaining hundreds of listings
-                url = urljoin(base_url, f"/immobilien/marktplatz/details/show/{ad_id}")
-                listings.append(Listing(
-                    provider="comparis", listing_id=sid,
-                    title=f"Comparis Listing {sid}", url=url, contact_url=url,
-                    description=""
-                ))
-                
-            return listings, False, len(all_ids)
-        except Exception as e:
-            logger.debug(f"Comparis robust mapping failed: {e}")
-
-    # Fallback to link heuristics
-    for a in soup.select('a[href*="/details/show/"]'):
-        href = a.get("href")
-        if not href: continue
-        url = urljoin(base_url, href)
-        listings.append(Listing(
-            provider="comparis", listing_id=str(abs(hash(url))),
-            title="Comparis Listing", url=url, contact_url=url
-        ))
-        
-    return list({l.url: l for l in listings}.values()), False, len(listings)
-
-def run(config_path: Path, providers_override: Optional[List[str]] = None):
+def run(config_path: Path, providers_override: Optional[List[str]] = None, limit: Optional[int] = None):
     cfg = load_config(config_path)
     search_cfg = cfg.get("search", {})
     criteria = cfg.get("criteria", {})
     llm_cfg = cfg.get("llm", {})
-    
-    if not llm_cfg.get("token"):
-        logger.warning("Hugging Face token missing in config.yaml under 'llm: token:'. LLM inference will be skipped, falling back to keywords.")
-    
+    google_key = cfg.get("google_maps_api_key", "")
     output_dir = Path(search_cfg.get("output_dir", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
     all_listings: List[Listing] = []
@@ -628,23 +557,14 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None):
         base_search_url = p_cfg.get("base_url")
         params = p_cfg.get("params", {}).copy()
         
-        # Specialized URL construction for Comparis
-        if provider == "comparis" and "request_object" in p_cfg:
-            import json
-            import urllib.parse
-            ro_json = json.dumps(p_cfg["request_object"])
-            params["requestobject"] = ro_json
-
         page = 1
         has_next = True
         provider_listings = []
         logger.info(f"Starting {provider} search...")
         
         while has_next and page <= 25:
-            if provider == "homegate":
-                params["ep"] = page
-            # Note: Comparis might use different pagination, 
-            # for now we assume the user provided URL is the start.
+            if provider == "homegate": params["ep"] = page
+            if provider == "comparis" and "request_object" in p_cfg: params["requestobject"] = json.dumps(p_cfg["request_object"])
             
             search_url = f"{base_search_url}?{urlencode(params)}"
             logger.info(f"[{provider}] Fetching page {page}...")
@@ -657,48 +577,65 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None):
                 has_next = False
             elif provider == "homegate":
                 found, has_next, total = parse_listings_from_html_homegate(urljoin(search_url, "/"), html)
-                logger.info(f"[{provider}] Found {len(found)} listings on page {page} (Total available: {total})")
+                logger.info(f"[{provider}] Found {len(found)} listings on page {page} (Total: {total})")
             elif provider == "comparis":
                 found, has_next, total = parse_listings_from_html_comparis(urljoin(search_url, "/"), html)
                 logger.info(f"[{provider}] Found {len(found)} listings.")
-                has_next = False # Initial basic support: one page
-            else:
-                found, has_next = [], False
+                has_next = False
+            else: found, has_next = [], False
             
             provider_listings.extend(found)
+            
+            if limit and len(provider_listings) >= limit:
+                logger.info(f"[{provider}] Reached limit of {limit} listings for this provider.")
+                provider_listings = provider_listings[:limit]
+                break
+                
             if not has_next: break
             page += 1
             time.sleep(1)
             
         logger.info(f"[{provider}] Completed search. Total collected: {len(provider_listings)}")
-        hydrate_details(provider_listings, 20, 1.0, llm_cfg)
-        all_listings.extend(provider_listings)
-    
+        
+        # Hydrate only up to the limit if specified
+        listings_to_hydrate = provider_listings
+        if limit:
+            listings_to_hydrate = provider_listings[:limit]
+            
+        hydrate_details(listings_to_hydrate, 20, 1.0, llm_cfg, google_key)
+        all_listings.extend(listings_to_hydrate)
+        
+        if limit and len(all_listings) >= limit:
+            logger.info(f"Reached overall limit of {limit} listings.")
+            break
+
     filtered, excluded = [], []
     for l in all_listings:
         p, r = listing_passes_filters(l, criteria)
         if p: filtered.append(l)
         else: excluded.append((l, r))
-        
+    
     ordered = sorted(filtered, key=lambda x: (x.price_chf or 999999), reverse=True)
     md_path = output_dir / "listings_filtered_llm.md"
     lines = ["# Zurich Apartment Results (LLM Mode)", ""]
     for l in ordered:
         price = f"CHF {l.price_chf:,.0f}".replace(",", "'") if l.price_chf else "Unknown"
-        lines.extend([f"## {l.title}", f"- **Price**: {price}", f"- **Provider**: {l.provider}", f"- **Distance**: {l.distance_km:.2f} km" if l.distance_km else "- **Distance**: Unknown", f"- [View]({l.url})", ""])
+        commute = f"PT: {l.travel_time_pt_min}m" if l.travel_time_pt_min else ""
+        walk = f"Walk: {l.walking_time_min}m" if l.walking_time_min else ""
+        commute_info = f" ({commute}{', ' if commute and walk else ''}{walk})" if commute or walk else ""
+        lines.extend([f"## {l.title}", f"- **Price**: {price}", f"- **Provider**: {l.provider}", f"- **Commute to Office**: {l.distance_km:.2f} km{commute_info}" if l.distance_km else "- **Distance**: Unknown", f"- [View]({l.url})", ""])
     md_path.write_text("\n".join(lines))
-    
     excl_path = output_dir / "listings_excluded_llm.md"
     excl_lines = ["# Excluded (LLM Mode)", ""]
-    for l, r in excluded:
-        excl_lines.extend([f"## {l.title}", f"- **REASONS**: {', '.join(r)}", f"- **Provider**: {l.provider}", f"- [View]({l.url})", ""])
+    for l, r in excluded: excl_lines.extend([f"## {l.title}", f"- **REASONS**: {', '.join(r)}", f"- **Provider**: {l.provider}", f"- [View]({l.url})", ""])
     excl_path.write_text("\n".join(excl_lines))
-    logger.info(f"Done. Total: {len(all_listings)}, Filtered: {len(filtered)}. Results in {md_path}")
+    logger.info(f"Done. Filtered: {len(filtered)}. Results in {md_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Apartment finder (LLM mode)")
-    parser.add_argument("--config", default="config.yaml", help="Path to config")
-    parser.add_argument("--providers", help="Comma-separated list of providers")
+    parser = argparse.ArgumentParser(description="Apartment finder")
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--providers")
+    parser.add_argument("--limit", type=int, help="Limit the number of listings to process")
     args = parser.parse_args()
     selected = [p.strip().lower() for p in args.providers.split(",")] if args.providers else None
-    run(Path(args.config), selected)
+    run(Path(args.config), selected, args.limit)
