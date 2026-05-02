@@ -159,21 +159,18 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
 
 def get_swiss_transport_time(lat, lon, address=None) -> Optional[int]:
     """Get commute time using public transport (transport.opendata.ch)"""
+    if lat is None or lon is None: return None
     url = "https://transport.opendata.ch/v1/connections"
-    
-    # Use address as source if it contains more than just 'Zurich'
     source = f"{lat},{lon}"
     if address and len(address) > 10 and "Zurich" in address:
-        # Check if it looks like a specific address (has a street name/number)
         if any(char.isdigit() for char in address):
             source = address
-
     params = {
         "from": source,
-        "to": "Zürich HB", # Europaallee is right next to HB
-        "date": "2026-05-04", # Next Monday
+        "to": "Zürich HB",
+        "date": "2026-05-04",
         "time": "08:30",
-        "limit": 4 # Check a few connections to find the best one
+        "limit": 4
     }
     try:
         r = requests.get(url, params=params, timeout=10)
@@ -186,25 +183,22 @@ def get_swiss_transport_time(lat, lon, address=None) -> Optional[int]:
                 if match:
                     d, h, m, s = map(int, match.groups())
                     durations.append(d * 1440 + h * 60 + m)
-            if durations:
-                return min(durations)
+            if durations: return min(durations)
     except Exception as e:
         logger.debug(f"Swiss Transport API error: {e}")
     return None
+
+def estimate_walking_time(distance_km: float) -> int:
+    """Estimate walking time based on a 5 km/h average speed (12 min/km)"""
+    return round((distance_km / 5.0) * 60 * 1.1)
 
 def get_google_maps_times(from_lat, from_lon, to_lat, to_lon, api_key: str) -> Tuple[Optional[int], Optional[int]]:
     """Get walking and transit times via Google Maps API"""
     if not api_key or from_lat is None or from_lon is None: return None, None
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    
     times = {}
     for mode in ["walking", "transit"]:
-        params = {
-            "origins": f"{from_lat},{from_lon}",
-            "destinations": f"{to_lat},{to_lon}",
-            "mode": mode,
-            "key": api_key
-        }
+        params = {"origins": f"{from_lat},{from_lon}", "destinations": f"{to_lat},{to_lon}", "mode": mode, "key": api_key}
         try:
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
@@ -212,9 +206,7 @@ def get_google_maps_times(from_lat, from_lon, to_lat, to_lon, api_key: str) -> T
                 if data["rows"][0]["elements"][0]["status"] == "OK":
                     duration_sec = data["rows"][0]["elements"][0]["duration"]["value"]
                     times[mode] = round(duration_sec / 60)
-        except Exception as e:
-            logger.debug(f"Google Maps API error ({mode}): {e}")
-            
+        except Exception as e: logger.debug(f"Google Maps API error ({mode}): {e}")
     return times.get("transit"), times.get("walking")
 
 def extract_coords(html: str) -> Tuple[Optional[float], Optional[float]]:
@@ -223,8 +215,7 @@ def extract_coords(html: str) -> Tuple[Optional[float], Optional[float]]:
         n, e, s, w = map(float, m.groups())
         return (n + s) / 2, (e + w) / 2
     m = re.search(r'"latitude":\s*([\d.]+),"longitude":\s*([\d.]+)', html)
-    if m:
-        return float(m.group(1)), float(m.group(2))
+    if m: return float(m.group(1)), float(m.group(2))
     return None, None
 
 def is_challenge_html(html: str) -> bool:
@@ -240,10 +231,7 @@ def parse_cookie_string(cookie_str: str, domain: str) -> List[Dict[str, Any]]:
     for part in parts:
         if "=" not in part: continue
         name, value = part.strip().split("=", 1)
-        cookies.append({
-            "name": name, "value": value,
-            "domain": domain, "path": "/"
-        })
+        cookies.append({"name": name, "value": value, "domain": domain, "path": "/"})
     return cookies
 
 def fetch_with_playwright(search_url: str, playwright_cfg: Dict[str, Any]) -> Optional[str]:
@@ -254,51 +242,37 @@ def fetch_with_playwright(search_url: str, playwright_cfg: Dict[str, Any]) -> Op
     challenge_wait = float(playwright_cfg.get("challenge_wait_seconds", 20))
     manual_continue = bool(playwright_cfg.get("manual_continue", False))
     dump_html_path = playwright_cfg.get("dump_html_path")
-    
     cookies = playwright_cfg.get("cookies") or []
     cookies_file = playwright_cfg.get("cookies_file")
     parsed_url = urlparse(search_url)
     domain = parsed_url.netloc
     if not domain.startswith("."): domain = "." + domain
-    
     if cookies_file and Path(cookies_file).exists():
         logger.info(f"Loading cookies from {cookies_file} for {domain}...")
         try:
             content = Path(cookies_file).read_text(encoding="utf-8")
             cookies.extend(parse_cookie_string(content, domain))
-        except Exception as e:
-            logger.error(f"Failed to read cookies: {e}")
-
+        except Exception as e: logger.error(f"Failed to read cookies: {e}")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=headless)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={'width': 1920, 'height': 1080}
-            )
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-            """)
+            context = browser.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", viewport={'width': 1920, 'height': 1080})
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = { runtime: {} };")
             if cookies: context.add_cookies(cookies)
             page = context.new_page()
             logger.info(f"Navigating to {search_url}...")
             page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
             page.wait_for_timeout(wait_time)
-            
             html = page.content()
             if is_challenge_html(html):
                 logger.warning("Bot challenge detected. Waiting for resolution...")
                 page.wait_for_timeout(int(challenge_wait * 1000))
-                if manual_continue and not headless:
-                    input("Solve the challenge in the browser, then press Enter here...")
+                if manual_continue and not headless: input("Solve the challenge in the browser, then press Enter here...")
                 html = page.content()
-            
             if dump_html_path:
                 Path(dump_html_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(dump_html_path).write_text(html, encoding="utf-8")
                 logger.info(f"Debug HTML dumped to {dump_html_path}")
-
             browser.close()
             return html
     except Exception as exc:
@@ -356,34 +330,26 @@ def parse_listings_from_html_homegate(base_url: str, html: str) -> Tuple[List[Li
     listings: List[Listing] = []
     has_next = False
     total_results = 0
-    
     json_data = None
     for pattern in [r'window\.__INITIAL_STATE__\s*=\s*', r'window\.__PINIA_INITIAL_STATE__\s*=\s*']:
         match = re.search(pattern, html)
         if match:
             try:
                 start_index = match.end()
-                decoder = json.JSONDecoder()
-                json_data, _ = decoder.raw_decode(html[start_index:])
+                json_data, _ = json.JSONDecoder().raw_decode(html[start_index:])
                 break
             except Exception: pass
-            
     if not json_data:
         next_data_tag = BeautifulSoup(html, "html.parser").select_one('script#__NEXT_DATA__')
         if next_data_tag:
-            try:
-                json_data = json.loads(next_data_tag.get_text())
+            try: json_data = json.loads(next_data_tag.get_text())
             except Exception: pass
-            
     if json_data:
         try:
             res_obj = _find_key_recursive(json_data, "result") or {}
-            items = res_obj.get("listings", [])
+            items = res_obj.get("listings", []) or _find_homegate_results(json_data)
             has_next = res_obj.get("hasNextPage", False)
             total_results = res_obj.get("resultCount", 0)
-            if not items:
-                items = _find_homegate_results(json_data)
-
             for item in items:
                 listing_data = item.get("listing") or item
                 id_ = item.get("id") or listing_data.get("id") or listing_data.get("listingId")
@@ -396,25 +362,17 @@ def parse_listings_from_html_homegate(base_url: str, html: str) -> Tuple[List[Li
                 rooms = chars.get("totalRooms") or listing_data.get("rooms")
                 addr = listing_data.get("address", {})
                 geo = addr.get("geoCoordinates") or addr.get("geo") or _find_key_recursive(item, "geoCoordinates")
-                lat, lon = None, None
-                if geo:
-                    lat = geo.get("latitude") or geo.get("lat")
-                    lon = geo.get("longitude") or geo.get("lon")
-                
+                lat, lon = (geo.get("latitude") or geo.get("lat"), geo.get("longitude") or geo.get("lon")) if geo else (None, None)
                 dist = haversine(lat, lon, OFFICE_LAT, OFFICE_LON) if lat and lon else None
-
                 listings.append(Listing(
                     provider="homegate", listing_id=str(id_),
                     title=listing_data.get("localization", {}).get("de", {}).get("text", {}).get("title") or listing_data.get("title") or "Homegate Listing",
-                    url=url, contact_url=url,
-                    price_chf=price, total_rooms=float(rooms) if rooms else None,
+                    url=url, contact_url=url, price_chf=price, total_rooms=float(rooms) if rooms else None,
                     address=f"{addr.get('street', '')}, {addr.get('postalCode', '')} {addr.get('locality', '')}".strip(", "),
                     lat=lat, lon=lon, distance_km=dist
                 ))
             if listings: return list({l.url: l for l in listings}.values()), has_next, total_results
-        except Exception as e:
-            logger.debug(f"Homegate JSON mapping failed: {e}")
-
+        except Exception as e: logger.debug(f"Homegate JSON mapping failed: {e}")
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.select('a[href*="/rent/"], a[href*="/mieten/"]'):
         href = a.get("href")
@@ -425,11 +383,7 @@ def parse_listings_from_html_homegate(base_url: str, html: str) -> Tuple[List[Li
         price = parse_price(title)
         rooms_match = re.search(r'(\d+(?:\.\d+)?)\s*rooms', title, re.I)
         rooms = float(rooms_match.group(1)) if rooms_match else None
-        listings.append(Listing(
-            provider="homegate", listing_id=str(abs(hash(url))),
-            title=title, url=url, contact_url=url,
-            price_chf=price, total_rooms=rooms, description=title
-        ))
+        listings.append(Listing(provider="homegate", listing_id=str(abs(hash(url))), title=title, url=url, contact_url=url, price_chf=price, total_rooms=rooms, description=title))
     return list({l.url: l for l in listings}.values()), False, len(listings)
 
 def parse_listings_from_html_comparis(base_url: str, html: str) -> Tuple[List[Listing], bool, int]:
@@ -456,25 +410,15 @@ def parse_listings_from_html_comparis(base_url: str, html: str) -> Tuple[List[Li
                     if "Zimmer" in info:
                         m = re.search(r'(\d+(?:\.\d+)?)', info)
                         if m: rooms = float(m.group(1))
-                listings.append(Listing(
-                    provider="comparis", listing_id=str(id_),
-                    title=title, url=url, contact_url=url,
-                    price_chf=price, total_rooms=rooms, address=address,
-                    description=title
-                ))
+                listings.append(Listing(provider="comparis", listing_id=str(id_), title=title, url=url, contact_url=url, price_chf=price, total_rooms=rooms, address=address, description=title))
             all_ids = res_data.get("adIds", [])
             for ad_id in all_ids:
                 sid = str(ad_id)
                 if sid in found_ids: continue
                 url = urljoin(base_url, f"/immobilien/marktplatz/details/show/{ad_id}")
-                listings.append(Listing(
-                    provider="comparis", listing_id=sid,
-                    title=f"Comparis Listing {sid}", url=url, contact_url=url,
-                    description=""
-                ))
+                listings.append(Listing(provider="comparis", listing_id=sid, title=f"Comparis Listing {sid}", url=url, contact_url=url, description=""))
             return listings, False, len(all_ids)
-        except Exception as e:
-            logger.debug(f"Comparis mapping failed: {e}")
+        except Exception as e: logger.debug(f"Comparis mapping failed: {e}")
     return [], False, 0
 
 def llm_extract_details(description: str, hf_token: str, model_id: str) -> Dict[str, Any]:
@@ -514,12 +458,13 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg
                 except Exception: pass
             if l.lat and l.lon:
                 l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
-                # Compute Commute
                 l.travel_time_pt_min = get_swiss_transport_time(l.lat, l.lon, l.address)
                 if google_key:
                     pt, walk = get_google_maps_times(l.lat, l.lon, OFFICE_LAT, OFFICE_LON, google_key)
                     l.travel_time_pt_min = pt or l.travel_time_pt_min
                     l.walking_time_min = walk
+                elif l.distance_km < 2.0:
+                    l.walking_time_min = estimate_walking_time(l.distance_km)
             desc_lower = l.description.lower() or l.title.lower()
             if any(k in desc_lower for k in SHARED_KEYWORDS): l.likely_shared = True
             if any(k in desc_lower for k in TEMP_KEYWORDS): l.is_temporary = True
@@ -544,13 +489,26 @@ def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[
     max_price = criteria.get("max_price")
     if max_price and listing.price_chf and listing.price_chf > float(max_price): reasons.append(f"Price CHF {listing.price_chf} > {max_price}")
     target_date = parse_date(criteria.get("available_on_or_before"))
-    if target_date and listing.available_from and listing.available_from > target_date: reasons.append("Date late")
+    if target_date:
+        if listing.available_from:
+            if listing.available_from > target_date: reasons.append(f"Date late ({listing.available_from})")
+        elif not include_unknown: reasons.append("Date unknown")
     min_bed = float(criteria.get("min_bedrooms", 2))
     cur_bed = listing.bedrooms or (max(1.0, listing.total_rooms - 1.0) if listing.total_rooms else None)
-    if cur_bed is not None and cur_bed < min_bed: reasons.append(f"Too few bedrooms ({cur_bed})")
-    if criteria.get("must_be_furnished") and listing.furnished is False: reasons.append("Not furnished")
-    if criteria.get("must_have_private_entire_place") and listing.likely_shared: reasons.append("Likely shared")
-    if criteria.get("must_be_indefinite", True) and listing.is_temporary: reasons.append("Temporary/Sublet")
+    if cur_bed is not None:
+        if cur_bed < min_bed: reasons.append(f"Too few bedrooms ({cur_bed})")
+    elif not include_unknown: reasons.append("Bedrooms unknown")
+    checks = [("must_be_furnished", "furnished", "Not furnished"), ("must_have_private_entire_place", "likely_shared", "Likely shared", True), ("must_be_indefinite", "is_temporary", "Temporary/Sublet", True)]
+    for crit_key, field_name, error_msg, *negate in checks:
+        required = criteria.get(crit_key, False)
+        if not required: continue
+        val = getattr(listing, field_name)
+        is_negated = negate[0] if negate else False
+        if val is None:
+            if not include_unknown: reasons.append(f"{error_msg} (unknown)")
+            continue
+        actual_val = not val if is_negated else val
+        if actual_val is False: reasons.append(error_msg)
     return len(reasons) == 0, reasons
 
 def run(config_path: Path, providers_override: Optional[List[str]] = None, limit: Optional[int] = None):
@@ -562,29 +520,21 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None, limit
     output_dir = Path(search_cfg.get("output_dir", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
     all_listings: List[Listing] = []
-    
     providers = providers_override or search_cfg.get("providers", [])
     for provider in providers:
         if provider not in search_cfg: continue
         p_cfg = search_cfg[provider]
         base_search_url = p_cfg.get("base_url")
         params = p_cfg.get("params", {}).copy()
-        
-        page = 1
-        has_next = True
-        provider_listings = []
+        page, has_next, provider_listings = 1, True, []
         logger.info(f"Starting {provider} search...")
-        
         while has_next and page <= 25:
             if provider == "homegate": params["ep"] = page
             if provider == "comparis" and "request_object" in p_cfg: params["requestobject"] = json.dumps(p_cfg["request_object"])
-            
             search_url = f"{base_search_url}?{urlencode(params)}"
             logger.info(f"[{provider}] Fetching page {page}...")
-            
             html = fetch_with_playwright(search_url, p_cfg.get("playwright", {}))
             if not html: break
-                
             if provider == "flatfox":
                 found = parse_listings_from_html(urljoin(search_url, "/"), html)
                 has_next = False
@@ -596,38 +546,23 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None, limit
                 logger.info(f"[{provider}] Found {len(found)} listings.")
                 has_next = False
             else: found, has_next = [], False
-            
             provider_listings.extend(found)
-            
             if limit and len(provider_listings) >= limit:
-                logger.info(f"[{provider}] Reached limit of {limit} listings for this provider.")
+                logger.info(f"[{provider}] Reached limit of {limit} listings.")
                 provider_listings = provider_listings[:limit]
                 break
-                
             if not has_next: break
             page += 1
             time.sleep(1)
-            
-        logger.info(f"[{provider}] Completed search. Total collected: {len(provider_listings)}")
-        
-        # Hydrate only up to the limit if specified
-        listings_to_hydrate = provider_listings
-        if limit:
-            listings_to_hydrate = provider_listings[:limit]
-            
-        hydrate_details(listings_to_hydrate, 20, 1.0, llm_cfg, google_key)
-        all_listings.extend(listings_to_hydrate)
-        
-        if limit and len(all_listings) >= limit:
-            logger.info(f"Reached overall limit of {limit} listings.")
-            break
-
+        logger.info(f"[{provider}] Completed search. Total: {len(provider_listings)}")
+        hydrate_details(provider_listings, 20, 1.0, llm_cfg, google_key)
+        all_listings.extend(provider_listings)
+        if limit and len(all_listings) >= limit: break
     filtered, excluded = [], []
     for l in all_listings:
         p, r = listing_passes_filters(l, criteria)
         if p: filtered.append(l)
         else: excluded.append((l, r))
-    
     ordered = sorted(filtered, key=lambda x: (x.price_chf or 999999), reverse=True)
     md_path = output_dir / "listings_filtered_llm.md"
     lines = ["# Zurich Apartment Results (LLM Mode)", ""]
@@ -642,13 +577,13 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None, limit
     excl_lines = ["# Excluded (LLM Mode)", ""]
     for l, r in excluded: excl_lines.extend([f"## {l.title}", f"- **REASONS**: {', '.join(r)}", f"- **Provider**: {l.provider}", f"- [View]({l.url})", ""])
     excl_path.write_text("\n".join(excl_lines))
-    logger.info(f"Done. Filtered: {len(filtered)}. Results in {md_path}")
+    logger.info(f"Done. Results in {md_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Apartment finder")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--providers")
-    parser.add_argument("--limit", type=int, help="Limit the number of listings to process")
+    parser.add_argument("--limit", type=int)
     args = parser.parse_args()
     selected = [p.strip().lower() for p in args.providers.split(",")] if args.providers else None
     run(Path(args.config), selected, args.limit)
