@@ -188,9 +188,23 @@ def get_swiss_transport_time(lat, lon, address=None) -> Optional[int]:
         logger.debug(f"Swiss Transport API error: {e}")
     return None
 
-def estimate_walking_time(distance_km: float) -> int:
-    """Estimate walking time based on a 5 km/h average speed (12 min/km)"""
-    return round((distance_km / 5.0) * 60 * 1.1)
+def get_osrm_walking_time(from_lat, from_lon, to_lat, to_lon) -> Optional[int]:
+    """Get real walking commute time using OSM Routing API (no key required)"""
+    if from_lat is None or from_lon is None: return None
+    # Use OSM foot-specific routing server
+    url = f"https://routing.openstreetmap.de/routed-foot/route/v1/foot/{from_lon},{from_lat};{to_lon},{to_lat}"
+    params = {"overview": "false"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("code") == "Ok" and data.get("routes"):
+                # duration is in seconds
+                duration_sec = data["routes"][0]["duration"]
+                return round(duration_sec / 60)
+    except Exception as e:
+        logger.debug(f"OSM Routing API error: {e}")
+    return None
 
 def get_google_maps_times(from_lat, from_lon, to_lat, to_lon, api_key: str) -> Tuple[Optional[int], Optional[int]]:
     """Get walking and transit times via Google Maps API"""
@@ -463,8 +477,8 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg
                     pt, walk = get_google_maps_times(l.lat, l.lon, OFFICE_LAT, OFFICE_LON, google_key)
                     l.travel_time_pt_min = pt or l.travel_time_pt_min
                     l.walking_time_min = walk
-                elif l.distance_km < 2.0:
-                    l.walking_time_min = estimate_walking_time(l.distance_km)
+                elif l.distance_km < 2.5:
+                    l.walking_time_min = get_osrm_walking_time(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
             desc_lower = l.description.lower() or l.title.lower()
             if any(k in desc_lower for k in SHARED_KEYWORDS): l.likely_shared = True
             if any(k in desc_lower for k in TEMP_KEYWORDS): l.is_temporary = True
