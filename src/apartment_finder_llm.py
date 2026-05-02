@@ -191,7 +191,6 @@ def get_swiss_transport_time(lat, lon, address=None) -> Optional[int]:
 def get_osrm_walking_time(from_lat, from_lon, to_lat, to_lon) -> Optional[int]:
     """Get real walking commute time using OSM Routing API (no key required)"""
     if from_lat is None or from_lon is None: return None
-    # Use OSM foot-specific routing server
     url = f"https://routing.openstreetmap.de/routed-foot/route/v1/foot/{from_lon},{from_lat};{to_lon},{to_lat}"
     params = {"overview": "false"}
     try:
@@ -199,7 +198,6 @@ def get_osrm_walking_time(from_lat, from_lon, to_lat, to_lon) -> Optional[int]:
         if r.status_code == 200:
             data = r.json()
             if data.get("code") == "Ok" and data.get("routes"):
-                # duration is in seconds
                 duration_sec = data["routes"][0]["duration"]
                 return round(duration_sec / 60)
     except Exception as e:
@@ -451,6 +449,45 @@ JSON Keys: furnished (bool), has_kitchen (bool), has_bathroom (bool), has_living
         return json.loads(json_match.group(0)) if json_match else {}
     except Exception: return {}
 
+def generate_html_dashboard(listings: List[Listing], output_path: Path, message_template: str):
+    listings_html = []
+    for i, l in enumerate(listings):
+        price_str = f"CHF {l.price_chf:,.0f}".replace(",", "'") if l.price_chf else "Unknown"
+        pt = f"{l.travel_time_pt_min}m" if l.travel_time_pt_min else "?"
+        walk = f"{l.walking_time_min}m" if l.walking_time_min else "?"
+        listings_html.append(f"""
+        <div class="card listing-card provider-{l.provider}">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-start">
+                    <h5 class="card-title">{l.title}</h5>
+                    <span class="badge bg-success badge-price">{price_str}</span>
+                </div>
+                <h6 class="card-subtitle mb-2 text-muted">{l.address or "Address unknown"}</h6>
+                <p class="card-text">
+                    <strong>Commute:</strong> {l.distance_km:.2f} km (PT: {pt}, Walk: {walk})<br>
+                    <strong>Rooms:</strong> {l.total_rooms or "?"} | <strong>Bedrooms:</strong> {l.bedrooms or "?"}<br>
+                    <strong>Available:</strong> {l.available_from or "Unknown"}<br>
+                    <span class="badge bg-light text-dark">Provider: {l.provider}</span>
+                </p>
+                <div class="d-grid gap-2 d-md-flex justify-content-md-end">
+                    <a href="{l.url}" target="_blank" class="btn btn-outline-secondary">View</a>
+                    <button onclick="contactListing('{l.contact_url}', {i})" id="btn-{i}" class="btn btn-danger px-4">⚡ Contact & Copy</button>
+                </div>
+            </div>
+        </div>""")
+    listings_joined = "\n".join(listings_html)
+    js_message = json.dumps(message_template)
+    html_content = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Zurich Apartment Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>body {{ background-color: #f8f9fa; padding-top: 20px; }} .listing-card {{ margin-bottom: 20px; }} .sticky-top-custom {{ position: sticky; top: 10px; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}</style></head>
+    <body><div class="container"><div class="row"><div class="col-12 mb-4"><h1 class="text-center">🏠 Zurich Apartment Finder</h1></div></div>
+    <div class="row"><div class="col-md-4"><div class="sticky-top-custom"><h5>📋 Message Template</h5><textarea id="msgTemplate" class="form-control" rows="15" readonly>{message_template}</textarea>
+    <button class="btn btn-primary w-100 mt-3" onclick="copyToClipboard('msgTemplate')">Copy Main Template</button></div></div>
+    <div class="col-md-8"><div id="listings">{listings_joined}</div></div></div></div>
+    <script>const message = {js_message}; function copyToClipboard(id) {{ const t = document.getElementById(id); t.select(); navigator.clipboard.writeText(t.value); }}
+    function contactListing(url, index) {{ navigator.clipboard.writeText(message).then(() => {{ const b = document.getElementById('btn-' + index); b.innerText = "✅ Copied!"; b.classList.replace('btn-danger', 'btn-success'); window.open(url, '_blank'); setTimeout(() => {{ b.innerText = "⚡ Contact & Copy"; b.classList.replace('btn-success', 'btn-danger'); }}, 3000); }}); }}</script></body></html>"""
+    output_path.write_text(html_content, encoding="utf-8")
+
 def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg: Dict[str, Any], google_key: str = ""):
     SHARED_KEYWORDS = ["mitbewohner", "wg-zimmer", "wohngemeinschaft", "shared flat", "stanza in", "roommate", "coloc"]
     TEMP_KEYWORDS = ["befristet", "untermiete", "sublet", "temporary", "short term", "fino al", "bis zum"]
@@ -469,6 +506,8 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg
                         for s in soup(["script", "style"]): s.decompose()
                         l.description = normalize_spaces(soup.get_text(" ", strip=True))[:4000]
                         if l.lat is None: l.lat, l.lon = extract_coords(r.text)
+                        contact_btn = soup.select_one('a[href*="/contact"], a[href*="mailto:"], button[data-href*="contact"]')
+                        if contact_btn: l.contact_url = urljoin(l.url, contact_btn.get("href") or contact_btn.get("data-href"))
                 except Exception: pass
             if l.lat and l.lon:
                 l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
@@ -531,6 +570,8 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None, limit
     criteria = cfg.get("criteria", {})
     llm_cfg = cfg.get("llm", {})
     google_key = cfg.get("google_maps_api_key", "")
+    msg_path = Path(cfg.get("contact", {}).get("message_template_path", "message_template.txt"))
+    msg_template = msg_path.read_text(encoding="utf-8") if msg_path.exists() else "No template found."
     output_dir = Path(search_cfg.get("output_dir", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
     all_listings: List[Listing] = []
@@ -586,12 +627,14 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None, limit
         walk = f"Walk: {l.walking_time_min}m" if l.walking_time_min else ""
         commute_info = f" ({commute}{', ' if commute and walk else ''}{walk})" if commute or walk else ""
         lines.extend([f"## {l.title}", f"- **Price**: {price}", f"- **Provider**: {l.provider}", f"- **Commute to Office**: {l.distance_km:.2f} km{commute_info}" if l.distance_km else "- **Distance**: Unknown", f"- [View]({l.url})", ""])
-    md_path.write_text("\n".join(lines))
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    html_path = output_dir / "dashboard.html"
+    generate_html_dashboard(ordered, html_path, msg_template)
     excl_path = output_dir / "listings_excluded_llm.md"
     excl_lines = ["# Excluded (LLM Mode)", ""]
     for l, r in excluded: excl_lines.extend([f"## {l.title}", f"- **REASONS**: {', '.join(r)}", f"- **Provider**: {l.provider}", f"- [View]({l.url})", ""])
-    excl_path.write_text("\n".join(excl_lines))
-    logger.info(f"Done. Results in {md_path}")
+    excl_path.write_text("\n".join(excl_lines), encoding="utf-8")
+    logger.info(f"Done. Filtered: {len(filtered)}. Dashboard: {html_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Apartment finder")
