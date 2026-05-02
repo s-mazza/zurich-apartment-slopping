@@ -157,25 +157,37 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def get_swiss_transport_time(from_lat, from_lon, to_lat, to_lon) -> Optional[int]:
+def get_swiss_transport_time(lat, lon, address=None) -> Optional[int]:
     """Get commute time using public transport (transport.opendata.ch)"""
-    if from_lat is None or from_lon is None: return None
     url = "https://transport.opendata.ch/v1/connections"
+    
+    # Use address as source if it contains more than just 'Zurich'
+    source = f"{lat},{lon}"
+    if address and len(address) > 10 and "Zurich" in address:
+        # Check if it looks like a specific address (has a street name/number)
+        if any(char.isdigit() for char in address):
+            source = address
+
     params = {
-        "from": f"{from_lat},{from_lon}",
-        "to": f"{to_lat},{to_lon}",
-        "limit": 1
+        "from": source,
+        "to": "Zürich HB", # Europaallee is right next to HB
+        "date": "2026-05-04", # Next Monday
+        "time": "08:30",
+        "limit": 4 # Check a few connections to find the best one
     }
     try:
         r = requests.get(url, params=params, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            if data.get("connections"):
-                duration_str = data["connections"][0]["duration"]
+            durations = []
+            for conn in data.get("connections", []):
+                duration_str = conn["duration"]
                 match = re.search(r'(\d+)d(\d{2}):(\d{2}):(\d{2})', duration_str)
                 if match:
                     d, h, m, s = map(int, match.groups())
-                    return d * 1440 + h * 60 + m
+                    durations.append(d * 1440 + h * 60 + m)
+            if durations:
+                return min(durations)
     except Exception as e:
         logger.debug(f"Swiss Transport API error: {e}")
     return None
@@ -502,7 +514,8 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg
                 except Exception: pass
             if l.lat and l.lon:
                 l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
-                l.travel_time_pt_min = get_swiss_transport_time(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
+                # Compute Commute
+                l.travel_time_pt_min = get_swiss_transport_time(l.lat, l.lon, l.address)
                 if google_key:
                     pt, walk = get_google_maps_times(l.lat, l.lon, OFFICE_LAT, OFFICE_LON, google_key)
                     l.travel_time_pt_min = pt or l.travel_time_pt_min
