@@ -2,6 +2,37 @@ search:
   providers:
     - flatfox
     - homegate
+    - comparis
+
+  comparis:
+    base_url: "https://www.comparis.ch/immobilien/result/list"
+    params:
+      sort: 11
+    # Comparis uses a JSON object in the 'requestobject' query param
+    request_object:
+      DealType: 10
+      SiteId: 0
+      RootPropertyTypes: []
+      PropertyTypes: []
+      RoomsFrom: "3"
+      PriceTo: "3600"
+      Radius: "6"
+      LocationSearchString: "8004"
+      Sort: 11
+      SwapProperty: 1
+      MinAvailableDate: "1753-01-01T00:00:00"
+    request_timeout_seconds: 30
+    detail_request_delay_seconds: 2.0
+    use_playwright_fallback: true
+    playwright:
+      enabled: true
+      headless: false
+      wait_after_load_seconds: 15
+      challenge_wait_seconds: 45
+      manual_continue: true
+      dump_html_path: "output/raw_search_playwright_comparis.html"
+      cookies_file: "cookies_comparis.txt"
+
   flatfox:
     # Zurich Search parameters
     base_url: "https://flatfox.ch/it/search/"

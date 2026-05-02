@@ -541,12 +541,79 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg
             time.sleep(delay)
         except Exception as e: logger.error(f"Error {l.url}: {e}")
 
+def parse_listings_from_html_comparis(base_url: str, html: str) -> Tuple[List[Listing], bool, int]:
+    listings: List[Listing] = []
+    soup = BeautifulSoup(html, "html.parser")
+    has_next = False
+    total_results = 0
+    
+    # Extraction from __NEXT_DATA__
+    tag = soup.select_one('script#__NEXT_DATA__')
+    if tag:
+        try:
+            data = json.loads(tag.get_text())
+            # Path verified: props.pageProps.initialResultData.resultItems
+            res_data = data.get("props", {}).get("pageProps", {}).get("initialResultData", {})
+            items = res_data.get("resultItems", [])
+            total_results = res_data.get("totalResultCount", 0)
+            
+            # Simple next page detection (Comparis uses client-side load more usually)
+            has_next = len(items) < total_results
+
+            for item in items:
+                id_ = item.get("AdId")
+                if not id_: continue
+                
+                url = urljoin(base_url, f"/immobilien/marktplatz/details/show/{id_}")
+                price = parse_price(item.get("PriceValue") or item.get("Price"))
+                
+                # Title and Address
+                title = item.get("Title", "Comparis Listing")
+                addr_parts = item.get("Address", [])
+                address = ", ".join(addr_parts) if isinstance(addr_parts, list) else str(addr_parts)
+                
+                # Basic room info from EssentialInformation list
+                rooms = None
+                for info in item.get("EssentialInformation", []):
+                    if "Zimmer" in info:
+                        m = re.search(r'(\d+(?:\.\d+)?)', info)
+                        if m: rooms = float(m.group(1))
+
+                listings.append(Listing(
+                    provider="comparis", listing_id=str(id_),
+                    title=title, url=url, contact_url=url,
+                    price_chf=price, total_rooms=rooms, address=address,
+                    description=title
+                ))
+            if listings: return list({l.url: l for l in listings}.values()), has_next, total_results
+        except Exception as e:
+            logger.debug(f"Comparis JSON mapping failed: {e}")
+
+    # Heuristic Fallback
+    for a in soup.select('a[href*="/details/show/"]'):
+        href = a.get("href")
+        if not href: continue
+        url = urljoin(base_url, href)
+        parent = a.find_parent(["div", "section"]) or a
+        title = normalize_spaces(parent.get_text(" ", strip=True))
+        price = parse_price(title)
+        listings.append(Listing(
+            provider="comparis", listing_id=str(abs(hash(url))),
+            title=title[:100], url=url, contact_url=url,
+            price_chf=price, description=title
+        ))
+        
+    return list({l.url: l for l in listings}.values()), False, len(listings)
+
 def run(config_path: Path, providers_override: Optional[List[str]] = None):
     cfg = load_config(config_path)
     search_cfg = cfg.get("search", {})
     criteria = cfg.get("criteria", {})
     llm_cfg = cfg.get("llm", {})
-    if not llm_cfg.get("token"): return
+    
+    if not llm_cfg.get("token"):
+        logger.warning("Hugging Face token missing in config.yaml under 'llm: token:'. LLM inference will be skipped, falling back to keywords.")
+    
     output_dir = Path(search_cfg.get("output_dir", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
     all_listings: List[Listing] = []
@@ -558,14 +625,23 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None):
         base_search_url = p_cfg.get("base_url")
         params = p_cfg.get("params", {}).copy()
         
+        # Specialized URL construction for Comparis
+        if provider == "comparis" and "request_object" in p_cfg:
+            import json
+            import urllib.parse
+            ro_json = json.dumps(p_cfg["request_object"])
+            params["requestobject"] = ro_json
+
         page = 1
         has_next = True
         provider_listings = []
         logger.info(f"Starting {provider} search...")
         
-        while has_next and page <= 25: # Safety limit
+        while has_next and page <= 25:
             if provider == "homegate":
                 params["ep"] = page
+            # Note: Comparis might use different pagination, 
+            # for now we assume the user provided URL is the start.
             
             search_url = f"{base_search_url}?{urlencode(params)}"
             logger.info(f"[{provider}] Fetching page {page}...")
@@ -579,6 +655,10 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None):
             elif provider == "homegate":
                 found, has_next, total = parse_listings_from_html_homegate(urljoin(search_url, "/"), html)
                 logger.info(f"[{provider}] Found {len(found)} listings on page {page} (Total available: {total})")
+            elif provider == "comparis":
+                found, has_next, total = parse_listings_from_html_comparis(urljoin(search_url, "/"), html)
+                logger.info(f"[{provider}] Found {len(found)} listings.")
+                has_next = False # Initial basic support: one page
             else:
                 found, has_next = [], False
             
