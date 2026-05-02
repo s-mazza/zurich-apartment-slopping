@@ -1,51 +1,69 @@
-# Apartment Finder (Zurigo)
+# Zurich Apartment Finder 🏠🇨🇭
 
-Script per raccogliere annunci da Flatfox, filtrarli con criteri configurabili e generare:
+Uno strumento professionale per automatizzare la ricerca di appartamenti a Zurigo, ottimizzato per la zona **Europaallee**. Aggrega annunci da più portali, calcola le distanze dall'ufficio e usa l'AI per filtrare solo i risultati migliori.
 
-- `output/listings_filtered.csv`
-- `output/listings_filtered.md` (con link cliccabili, incluso contatto 1-click)
-- `quick_contact_message.txt`
+## 🚀 Caratteristiche Principali
 
-## Setup
+- **Multi-Provider:** Supporto completo per **Flatfox** e **Homegate**.
+- **LLM Reasoning (AI):** Usa modelli di pensiero avanzati (**DeepSeek-R1**) per interpretare le descrizioni e scartare annunci non idonei (es. stanze in condivisione, subaffitti temporanei).
+- **Paginazione Automatica:** Recupera tutti i risultati disponibili (es. oltre 250 annunci su Homegate).
+- **Distanza Smart:** Calcola automaticamente la distanza in km dall'ufficio (Europaallee 1) usando coordinate geografiche reali.
+- **Bypass Anti-Bot:** Sistema di "Stealth Masking" e iniezione automatica di cookie per superare Cloudflare e DataDome.
+- **Audit Completo:** Genera report dettagliati degli appartamenti idonei e di quelli scartati (con motivazione).
+
+## 🛠️ Setup
 
 ```bash
+# 1. Crea e attiva virtualenv
 python3 -m venv .venv
 source .venv/bin/activate
+
+# 2. Installa dipendenze
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-## Uso
+## 📖 Utilizzo
 
+### Modalità Standard (Veloce)
+Usa regex e keyword predefinite. Ideale per una scansione rapida.
 ```bash
 python3 src/apartment_finder.py
 ```
 
-## Configurazione
+### Modalità AI (Consigliata)
+Usa un modello linguistico su Hugging Face per un filtraggio perfetto.
+```bash
+python3 src/apartment_finder_llm.py
+```
 
-Tutti i parametri sono in `config.yaml`:
+**Opzioni Avanzate:**
+- Filtra per provider: `python3 src/apartment_finder_llm.py --providers homegate`
+- Configurazione custom: `python3 src/apartment_finder_llm.py --config config_alt.yaml`
 
-- URL di ricerca Flatfox
-- Data limite disponibilita
-- Camere minime
-- Vincoli (arredato, cucina, bagno, soggiorno, divano, ecc.)
-- Feature opzionali (lavatrice, lavastoviglie)
+## ⚙️ Configurazione (`config.yaml`)
 
-L'impostazione `include_unknowns_to_avoid_false_negatives: true` mantiene un comportamento permissivo:
-se un dato non e esplicito nell'annuncio, non viene scartato automaticamente.
+Il file è diviso in tre sezioni chiave:
+1.  **Search:** Parametri geografici (bounding box), locali minimi e impostazioni Playwright.
+2.  **LLM:** Token di Hugging Face e ID del modello (default: `DeepSeek-R1-Distill-Qwen-32B`).
+3.  **Criteria:** Filtri locali rigorosi come `max_price`, `must_be_indefinite` (no temporanei), `min_bedrooms`.
 
-## Note importanti
+### Gestione Cookie (Homegate)
+Se vieni bloccato, crea un file `cookies_homegate.txt` nella root e incolla i cookie esportati dal tuo browser. Lo script li inietterà automaticamente.
 
-- Il parser tenta prima endpoint API pubblici, poi fallback HTML.
-- Se Flatfox mostra challenge anti-bot, e attivo fallback Playwright (browser reale).
-- Alcuni annunci potrebbero richiedere sessione loggata/cookie per dettagli o contatto.
-- In caso di blocchi anti-bot, serve usare cookie browser/sessione autenticata.
+## 📊 Output
 
-### Per challenge/cookie
+I risultati vengono salvati nella cartella `output/`:
+- `listings_filtered_llm.md`: Elenco ordinato degli appartamenti idonei con link 1-click.
+- `listings_excluded_llm.md`: Log di audit con il motivo dello scarto per ogni annuncio.
+- `apartment_finder_llm.log`: Log tecnici per il debug.
 
-Configura `search.flatfox.playwright` in `config.yaml`:
+## 🧪 Test Suite
 
-- `headless: false` per vedere il browser
-- `manual_continue: true` per risolvere challenge manualmente e premere Invio
-- `cookies` per iniettare cookie sessione Flatfox
-- `dump_html_path` per salvare HTML finale utile al debug
+Ho incluso una suite di **48 test** per garantire la precisione del parsing (prezzi, date, distanze).
+```bash
+PYTHONPATH=. pytest tests/test_apartment_finder.py
+```
+
+---
+*Progettato per trovare casa a Zurigo in modo chirurgico, evitando perdite di tempo con annunci irrilevanti.*
