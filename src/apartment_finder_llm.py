@@ -544,35 +544,27 @@ def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg
 def parse_listings_from_html_comparis(base_url: str, html: str) -> Tuple[List[Listing], bool, int]:
     listings: List[Listing] = []
     soup = BeautifulSoup(html, "html.parser")
-    has_next = False
-    total_results = 0
     
-    # Extraction from __NEXT_DATA__
     tag = soup.select_one('script#__NEXT_DATA__')
     if tag:
         try:
             data = json.loads(tag.get_text())
-            # Path verified: props.pageProps.initialResultData.resultItems
             res_data = data.get("props", {}).get("pageProps", {}).get("initialResultData", {})
-            items = res_data.get("resultItems", [])
-            total_results = res_data.get("totalResultCount", 0)
             
-            # Simple next page detection (Comparis uses client-side load more usually)
-            has_next = len(items) < total_results
-
+            # 1. Map the full items provided in the first page (usually 10)
+            items = res_data.get("resultItems", [])
+            found_ids = set()
             for item in items:
                 id_ = item.get("AdId")
                 if not id_: continue
+                found_ids.add(str(id_))
                 
                 url = urljoin(base_url, f"/immobilien/marktplatz/details/show/{id_}")
                 price = parse_price(item.get("PriceValue") or item.get("Price"))
-                
-                # Title and Address
                 title = item.get("Title", "Comparis Listing")
                 addr_parts = item.get("Address", [])
                 address = ", ".join(addr_parts) if isinstance(addr_parts, list) else str(addr_parts)
                 
-                # Basic room info from EssentialInformation list
                 rooms = None
                 for info in item.get("EssentialInformation", []):
                     if "Zimmer" in info:
@@ -585,22 +577,33 @@ def parse_listings_from_html_comparis(base_url: str, html: str) -> Tuple[List[Li
                     price_chf=price, total_rooms=rooms, address=address,
                     description=title
                 ))
-            if listings: return list({l.url: l for l in listings}.values()), has_next, total_results
+            
+            # 2. Extract ALL IDs (the user sees 400+, we found 453 in the JSON)
+            all_ids = res_data.get("adIds", [])
+            for ad_id in all_ids:
+                sid = str(ad_id)
+                if sid in found_ids: continue
+                
+                # Create stubs for the remaining hundreds of listings
+                url = urljoin(base_url, f"/immobilien/marktplatz/details/show/{ad_id}")
+                listings.append(Listing(
+                    provider="comparis", listing_id=sid,
+                    title=f"Comparis Listing {sid}", url=url, contact_url=url,
+                    description=""
+                ))
+                
+            return listings, False, len(all_ids)
         except Exception as e:
-            logger.debug(f"Comparis JSON mapping failed: {e}")
+            logger.debug(f"Comparis robust mapping failed: {e}")
 
-    # Heuristic Fallback
+    # Fallback to link heuristics
     for a in soup.select('a[href*="/details/show/"]'):
         href = a.get("href")
         if not href: continue
         url = urljoin(base_url, href)
-        parent = a.find_parent(["div", "section"]) or a
-        title = normalize_spaces(parent.get_text(" ", strip=True))
-        price = parse_price(title)
         listings.append(Listing(
             provider="comparis", listing_id=str(abs(hash(url))),
-            title=title[:100], url=url, contact_url=url,
-            price_chf=price, description=title
+            title="Comparis Listing", url=url, contact_url=url
         ))
         
     return list({l.url: l for l in listings}.values()), False, len(listings)

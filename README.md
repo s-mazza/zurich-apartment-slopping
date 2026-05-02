@@ -4,7 +4,7 @@ Uno strumento professionale per automatizzare la ricerca di appartamenti a Zurig
 
 ## 🚀 Caratteristiche Principali
 
-- **Multi-Provider:** Supporto completo per **Flatfox** e **Homegate**.
+- **Multi-Provider:** Supporto completo per **Flatfox**, **Homegate** e **Comparis.ch**.
 - **LLM Reasoning (AI):** Usa modelli di pensiero avanzati (**DeepSeek-R1**) per interpretare le descrizioni e scartare annunci non idonei (es. stanze in condivisione, subaffitti temporanei).
 - **Paginazione Automatica:** Recupera tutti i risultati disponibili (es. oltre 250 annunci su Homegate).
 - **Distanza Smart:** Calcola automaticamente la distanza in km dall'ufficio (Europaallee 1) usando coordinate geografiche reali.
