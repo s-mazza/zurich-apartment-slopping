@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 import logging
@@ -420,6 +421,30 @@ def dedupe_listings(listings: List[Listing]) -> List[Listing]:
             seen[l.url] = l
     return list(seen.values())
 
+def _find_homegate_results(node: Any) -> List[Dict[str, Any]]:
+    """Recursively locate Homegate result lists in NEXT_DATA payloads."""
+    if isinstance(node, list):
+        if node and all(isinstance(x, dict) for x in node):
+            keys = set().union(*(set(x.keys()) for x in node if isinstance(x, dict)))
+            if any(k in keys for k in ("id", "listingId", "slug")):
+                return node
+        for item in node:
+            found = _find_homegate_results(item)
+            if found:
+                return found
+    elif isinstance(node, dict):
+        for key in ("results", "items", "listings", "hits"):
+            value = node.get(key)
+            if isinstance(value, list):
+                found = _find_homegate_results(value)
+                if found:
+                    return found
+        for value in node.values():
+            found = _find_homegate_results(value)
+            if found:
+                return found
+    return []
+
 def hydrate_details(listings: List[Listing], timeout: int, delay: float):
     total = len(listings)
     logger.info(f"Hydrating details for {total} listings (estimated time: {total * (delay + 1):.0f}s)...")
@@ -487,6 +512,14 @@ def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[
     include_unknown = bool(criteria.get("include_unknowns_to_avoid_false_negatives", True))
     reasons = []
     
+    # Price filter
+    max_price = criteria.get("max_price")
+    if max_price and listing.price_chf:
+        if listing.price_chf > float(max_price):
+            reasons.append(f"Price CHF {listing.price_chf} > {max_price}")
+    elif max_price and not include_unknown and listing.price_chf is None:
+        reasons.append("Price unknown")
+
     # Date filter
     target_date = parse_date(criteria.get("available_on_or_before"))
     if target_date and listing.available_from:
@@ -534,7 +567,62 @@ def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[
 
 from urllib.parse import urlencode
 
-def run(config_path: Path):
+def parse_listings_from_html_homegate(base_url: str, html: str) -> List[Listing]:
+    listings: List[Listing] = []
+    soup = BeautifulSoup(html, "html.parser")
+    
+    # Homegate uses Next.js, full data is in __NEXT_DATA__ script
+    next_data = soup.select_one('script#__NEXT_DATA__')
+    if next_data:
+        try:
+            data = json.loads(next_data.get_text())
+            items = data.get("props", {}).get("pageProps", {}).get("initialState", {}).get("search", {}).get("results", [])
+            if not items:
+                items = _find_homegate_results(data)
+            for item in items:
+                # Homegate internal ID
+                id_ = item.get("id") or item.get("listingId")
+                if not id_: continue
+                
+                # Construct URL
+                detail_url = item.get("detailUrl") or item.get("url")
+                url = to_absolute(base_url, detail_url) if detail_url else urljoin(base_url, f"/rent/{id_}")
+                title = item.get("title", "Homegate Listing")
+                
+                # Basic info
+                price = parse_price(item.get("price"))
+                rooms = item.get("rooms")
+                
+                listings.append(Listing(
+                    provider="homegate",
+                    listing_id=str(id_),
+                    title=title,
+                    url=url,
+                    contact_url=url,
+                    price_chf=price,
+                    total_rooms=float(rooms) if rooms else None,
+                    address=f"{item.get('street', '')}, {item.get('zip', '')} {item.get('city', '')}".strip(", "),
+                    description=title
+                ))
+            if listings: return dedupe_listings(listings)
+        except Exception as e:
+            logger.debug(f"Failed to parse Homegate NEXT_DATA: {e}")
+
+    # Fallback to links
+    for a in soup.select('a[href*="/rent/"], a[href*="/mieten/"]'):
+        href = a.get("href")
+        if not href or len(href) < 15: continue
+        if any(x in href for x in ["/rent/real-estate", "/mieten/immobilien", "city-zurich", "/matching-list"]): continue
+        url = to_absolute(base_url, href)
+        title = normalize_spaces(a.get_text(" ", strip=True)) or "Homegate Listing"
+        listings.append(Listing(
+            provider="homegate", listing_id=str(abs(hash(url))),
+            title=title, url=url, contact_url=url, description=title
+        ))
+    
+    return dedupe_listings(listings)
+
+def run(config_path: Path, providers_override: Optional[List[str]] = None):
     cfg = load_config(config_path)
     search_cfg = cfg.get("search", {})
     criteria = cfg.get("criteria", {})
@@ -542,35 +630,56 @@ def run(config_path: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     
     all_listings: List[Listing] = []
+    providers = providers_override or search_cfg.get("providers", [])
     
-    if "flatfox" in search_cfg.get("providers", []):
-        ff = search_cfg["flatfox"]
-        base_search_url = ff.get("base_url", "https://flatfox.ch/it/search/")
-        params = ff.get("params", {})
+    for provider in providers:
+        if provider not in search_cfg:
+            logger.warning(f"Provider {provider} configured in 'providers' but section missing.")
+            continue
+            
+        p_cfg = search_cfg[provider]
+        base_search_url = p_cfg.get("base_url")
+        params = p_cfg.get("params", {})
         search_url = f"{base_search_url}?{urlencode(params)}"
+        request_headers = {"User-Agent": "Mozilla/5.0"}
+        request_headers.update(p_cfg.get("request_headers", {}))
         
-        logger.info(f"Starting Flatfox search ({search_url})...")
+        logger.info(f"Starting {provider} search ({search_url})...")
         
         html = None
+        # Try direct request
         try:
-            r = requests.get(search_url, timeout=ff.get("request_timeout_seconds", 20))
+            r = requests.get(
+                search_url,
+                timeout=p_cfg.get("request_timeout_seconds", 20),
+                headers=request_headers,
+                cookies=p_cfg.get("cookies", {}),
+            )
             if not is_challenge_html(r.text):
                 html = r.text
             else:
-                logger.info("Direct request blocked by anti-bot, trying Playwright...")
+                logger.info(f"[{provider}] Direct request blocked by anti-bot, trying Playwright...")
         except Exception as e:
-            logger.warning(f"Direct request failed: {e}")
+            logger.warning(f"[{provider}] Direct request failed: {e}")
             
-        if not html and ff.get("use_playwright_fallback"):
-            html = fetch_with_playwright(search_url, ff.get("playwright", {}))
+        if not html and p_cfg.get("use_playwright_fallback"):
+            html = fetch_with_playwright(search_url, p_cfg.get("playwright", {}))
             
         if html:
-            found = parse_listings_from_html(urljoin(search_url, "/"), html)
-            logger.info(f"Found {len(found)} initial listings.")
-            hydrate_details(found, ff.get("request_timeout_seconds", 20), ff.get("detail_request_delay_seconds", 0.5))
+            if provider == "flatfox":
+                found = parse_listings_from_html(urljoin(search_url, "/"), html)
+            elif provider == "homegate":
+                found = parse_listings_from_html_homegate(urljoin(search_url, "/"), html)
+            else:
+                found = []
+                
+            logger.info(f"[{provider}] Found {len(found)} initial listings.")
+            if provider == "homegate" and len(found) == 0:
+                logger.warning("[homegate] Parsed 0 listings. If anti-bot persists, provide session cookies in config.")
+            hydrate_details(found, p_cfg.get("request_timeout_seconds", 20), p_cfg.get("detail_request_delay_seconds", 0.5))
             all_listings.extend(found)
         else:
-            logger.error("Could not retrieve search page.")
+            logger.error(f"[{provider}] Could not retrieve search page.")
 
     # Filtering and Auditing
     filtered = []
@@ -630,4 +739,20 @@ def run(config_path: Path):
     logger.info(f"Results exported to {md_path} and audit log to {excl_path}")
 
 if __name__ == "__main__":
-    run(Path("config.yaml"))
+    parser = argparse.ArgumentParser(description="Apartment finder")
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to YAML config file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--providers",
+        help="Comma-separated providers to run (e.g. homegate or flatfox,homegate)",
+    )
+    args = parser.parse_args()
+
+    selected_providers = None
+    if args.providers:
+        selected_providers = [p.strip().lower() for p in args.providers.split(",") if p.strip()]
+
+    run(Path(args.config), providers_override=selected_providers)
