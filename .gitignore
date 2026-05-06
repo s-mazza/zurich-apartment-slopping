@@ -1,6 +1,5 @@
 .venv/
 **/__pycache__/
-output/
 *.log
 cookies_homegate.txt
 cookies_flatfox.txt
