@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse, urlencode
 
 import requests
+from huggingface_hub import InferenceClient
 import yaml
 from bs4 import BeautifulSoup
 from dateutil import parser as dt_parser
@@ -138,6 +139,15 @@ def parse_date(raw: Any) -> Optional[date]:
     if isinstance(raw, date): return raw
     text = str(raw).strip()
     if not text: return None
+    
+    # Fast path for YYYY-MM-DD to avoid dayfirst=True messing up month/day
+    iso_match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+    if iso_match:
+        try:
+            return dt_parser.parse(iso_match.group(1)).date()
+        except Exception:
+            pass
+            
     try:
         return dt_parser.parse(text, dayfirst=True, fuzzy=True).date()
     except Exception:
@@ -434,20 +444,47 @@ def parse_listings_from_html_comparis(base_url: str, html: str) -> Tuple[List[Li
     return [], False, 0
 
 def llm_extract_details(description: str, hf_token: str, model_id: str) -> Dict[str, Any]:
-    if not hf_token: return {}
+    if not hf_token:
+        logger.warning("No LLM token found. Skipping LLM extraction.")
+        return {}
     trimmed_desc = description[:2500]
-    prompt = f"""[INST] Task: Analyze this Zurich apartment listing and extract data.
-JSON Keys: furnished (bool), has_kitchen (bool), has_bathroom (bool), has_living_room (bool), has_sofa (bool), has_washing_machine (bool), has_dishwasher (bool), likely_shared (bool), is_temporary (bool), bedrooms (float), total_rooms (float), available_from (YYYY-MM-DD). Output ONLY JSON.[/INST]\n\nDescription:\n{trimmed_desc}"""
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    api_url = f"https://api-inference.huggingface.co/models/{model_id}"
+    system_prompt = (
+        "You are a structured data extractor. Analyze the apartment listing and output ONLY a valid JSON object. "
+        "No extra text, no markdown, no explanation."
+    )
+    user_prompt = (
+        f"Extract the following fields from this apartment listing.\n"
+        f"JSON Keys: furnished (bool), has_kitchen (bool), has_bathroom (bool), has_living_room (bool), "
+        f"has_sofa (bool), has_washing_machine (bool), has_dishwasher (bool), likely_shared (bool), "
+        f"is_temporary (bool, true if contract is time-limited, sublet, or has an end date), "
+        f"bedrooms (float), total_rooms (float), available_from (YYYY-MM-DD string or null).\n\n"
+        f"Listing:\n{trimmed_desc}"
+    )
+    logger.info(f"[LLM] Calling {model_id} via InferenceClient (desc length={len(trimmed_desc)} chars)")
     try:
-        payload = {"inputs": prompt, "parameters": {"return_full_text": False, "temperature": 0.1, "max_new_tokens": 1500}, "options": {"wait_for_model": True}}
-        r = requests.post(api_url, headers=headers, json=payload, timeout=90)
-        if r.status_code != 200: return {}
-        clean_text = re.sub(r'<think>.*?</think>', '', r.json()[0].get("generated_text", ""), flags=re.DOTALL).strip()
+        client = InferenceClient(api_key=hf_token)
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=512,
+            temperature=0.1,
+        )
+        generated_text = response.choices[0].message.content or ""
+        logger.info(f"[LLM] Raw response (first 600 chars): {generated_text[:600]!r}")
+        clean_text = re.sub(r'<think>.*?</think>', '', generated_text, flags=re.DOTALL).strip()
         json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
-        return json.loads(json_match.group(0)) if json_match else {}
-    except Exception: return {}
+        if not json_match:
+            logger.warning("[LLM] No JSON object found in response!")
+            return {}
+        parsed = json.loads(json_match.group(0))
+        logger.info(f"[LLM] Parsed result: {parsed}")
+        return parsed
+    except Exception as e:
+        logger.error(f"[LLM] Exception during LLM call: {e}")
+        return {}
 
 def generate_html_dashboard(listings: List[Listing], output_path: Path, message_template: str):
     listings_html = []
@@ -488,53 +525,126 @@ def generate_html_dashboard(listings: List[Listing], output_path: Path, message_
     function contactListing(url, index) {{ navigator.clipboard.writeText(message).then(() => {{ const b = document.getElementById('btn-' + index); b.innerText = "✅ Copied!"; b.classList.replace('btn-danger', 'btn-success'); window.open(url, '_blank'); setTimeout(() => {{ b.innerText = "⚡ Contact & Copy"; b.classList.replace('btn-success', 'btn-danger'); }}, 3000); }}); }}</script></body></html>"""
     output_path.write_text(html_content, encoding="utf-8")
 
-def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg: Dict[str, Any], google_key: str = ""):
+def hydrate_details(listings: List[Listing], timeout: int, delay: float, llm_cfg: Dict[str, Any], google_key: str = "", use_llm: bool = True, session: Optional[requests.Session] = None, playwright_cfg: Optional[Dict[str, Any]] = None):
     SHARED_KEYWORDS = ["mitbewohner", "wg-zimmer", "wohngemeinschaft", "shared flat", "stanza in", "roommate", "coloc"]
     TEMP_KEYWORDS = ["befristet", "untermiete", "sublet", "temporary", "short term", "fino al", "bis zum"]
     total = len(listings)
-    hf_token = llm_cfg.get("token")
+    hf_token = llm_cfg.get("token") if use_llm else None
     model_id = llm_cfg.get("model_id")
-    logger.info(f"Hydrating {total} listings via Hybrid LLM...")
-    for idx, l in enumerate(listings, 1):
-        try:
-            logger.info(f"[{idx}/{total}] Processing ({l.provider}): {l.title[:30]}...")
-            if l.description == "" or l.lat is None:
-                try:
-                    r = requests.get(l.url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
-                    if r.status_code < 400:
-                        soup = BeautifulSoup(r.text, "html.parser")
-                        for s in soup(["script", "style"]): s.decompose()
-                        l.description = normalize_spaces(soup.get_text(" ", strip=True))[:4000]
-                        if l.lat is None: l.lat, l.lon = extract_coords(r.text)
-                        contact_btn = soup.select_one('a[href*="/contact"], a[href*="mailto:"], button[data-href*="contact"]')
-                        if contact_btn: l.contact_url = urljoin(l.url, contact_btn.get("href") or contact_btn.get("data-href"))
-                except Exception: pass
-            if l.lat and l.lon:
-                l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
-                l.travel_time_pt_min = get_swiss_transport_time(l.lat, l.lon, l.address)
-                if google_key:
-                    pt, walk = get_google_maps_times(l.lat, l.lon, OFFICE_LAT, OFFICE_LON, google_key)
-                    l.travel_time_pt_min = pt or l.travel_time_pt_min
-                    l.walking_time_min = walk
-                elif l.distance_km < 2.5:
-                    l.walking_time_min = get_osrm_walking_time(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
-            desc_lower = l.description.lower() or l.title.lower()
-            if any(k in desc_lower for k in SHARED_KEYWORDS): l.likely_shared = True
-            if any(k in desc_lower for k in TEMP_KEYWORDS): l.is_temporary = True
-            data = llm_extract_details(l.description if l.description else l.title, hf_token, model_id)
-            l.likely_shared = l.likely_shared or data.get("likely_shared", False)
-            l.is_temporary = l.is_temporary or data.get("is_temporary", False)
-            l.furnished = data.get("furnished", l.furnished)
-            l.has_kitchen = data.get("has_kitchen", l.has_kitchen)
-            l.has_living_room = data.get("has_living_room", l.has_living_room)
-            l.has_sofa = data.get("has_sofa", l.has_sofa)
-            l.has_washing_machine = data.get("has_washing_machine", l.has_washing_machine)
-            l.has_dishwasher = data.get("has_dishwasher", l.has_dishwasher)
-            if l.price_chf is None: l.price_chf = parse_price(l.description if l.description else l.title)
-            if l.available_from is None: l.available_from = parse_date(data.get("available_from")) or parse_date(l.description)
-            if l.bedrooms is None: l.bedrooms = data.get("bedrooms")
-            time.sleep(delay)
-        except Exception as e: logger.error(f"Error {l.url}: {e}")
+    mode = "Hybrid LLM" if use_llm else "keyword-only (LLM disabled)"
+    logger.info(f"Hydrating {total} listings [{mode}]...")
+    _session = session or requests.Session()
+    _session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", "Accept-Language": "de-CH,de;q=0.9,en;q=0.8"})
+
+    pw_context = None
+    pw_browser = None
+    playwright_obj = None
+
+    if playwright_cfg and playwright_cfg.get("enabled", False) and sync_playwright:
+        headless = bool(playwright_cfg.get("headless", True))
+        cookies_file = playwright_cfg.get("cookies_file")
+        cookies = []
+        if cookies_file and Path(cookies_file).exists() and listings:
+            domain = urlparse(listings[0].url).netloc
+            if not domain.startswith("."): domain = "." + domain
+            try:
+                content = Path(cookies_file).read_text(encoding="utf-8")
+                cookies.extend(parse_cookie_string(content, domain))
+            except Exception as e: logger.error(f"Failed to read cookies: {e}")
+        
+        logger.info(f"Starting Playwright for detail fetching...")
+        playwright_obj = sync_playwright().start()
+        pw_browser = playwright_obj.chromium.launch(headless=headless)
+        pw_context = pw_browser.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", viewport={'width': 1920, 'height': 1080})
+        pw_context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = { runtime: {} };")
+        if cookies: pw_context.add_cookies(cookies)
+
+    try:
+        for idx, l in enumerate(listings, 1):
+            try:
+                logger.info(f"[{idx}/{total}] Processing ({l.provider}): {l.title[:30]}...")
+                if l.description == "" or l.lat is None:
+                    try:
+                        if pw_context:
+                            page = pw_context.new_page()
+                            page.goto(l.url, wait_until="domcontentloaded", timeout=timeout*1000)
+                            page.wait_for_timeout(2000)
+                            html = page.content()
+                            if is_challenge_html(html):
+                                challenge_wait = float(playwright_cfg.get("challenge_wait_seconds", 20))
+                                logger.warning(f"Bot challenge on {l.url}. Waiting...")
+                                page.wait_for_timeout(int(challenge_wait * 1000))
+                                html = page.content()
+                            page.close()
+                            soup = BeautifulSoup(html, "html.parser")
+                            for s in soup(["script", "style"]): s.decompose()
+                            l.description = normalize_spaces(soup.get_text(" ", strip=True))[:4000]
+                            if l.lat is None: l.lat, l.lon = extract_coords(html)
+                            contact_btn = soup.select_one('a[href*="/contact"], a[href*="mailto:"], button[data-href*="contact"]')
+                            if contact_btn: l.contact_url = urljoin(l.url, contact_btn.get("href") or contact_btn.get("data-href"))
+                        else:
+                            r = _session.get(l.url, timeout=timeout)
+                            if r.status_code < 400:
+                                soup = BeautifulSoup(r.text, "html.parser")
+                                for s in soup(["script", "style"]): s.decompose()
+                                l.description = normalize_spaces(soup.get_text(" ", strip=True))[:4000]
+                                if l.lat is None: l.lat, l.lon = extract_coords(r.text)
+                                contact_btn = soup.select_one('a[href*="/contact"], a[href*="mailto:"], button[data-href*="contact"]')
+                                if contact_btn: l.contact_url = urljoin(l.url, contact_btn.get("href") or contact_btn.get("data-href"))
+                            else:
+                                logger.warning(f"[{r.status_code}] Could not fetch details for {l.url} (will use search-result data only)")
+                    except Exception as ex:
+                        logger.error(f"Error getting details for {l.url}: {ex}") 
+                
+                if l.lat and l.lon:
+                    l.distance_km = haversine(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
+                    l.travel_time_pt_min = get_swiss_transport_time(l.lat, l.lon, l.address)
+                    if google_key:
+                        pt, walk = get_google_maps_times(l.lat, l.lon, OFFICE_LAT, OFFICE_LON, google_key)
+                        l.travel_time_pt_min = pt or l.travel_time_pt_min
+                        l.walking_time_min = walk
+                    elif l.distance_km < 2.5:
+                        l.walking_time_min = get_osrm_walking_time(l.lat, l.lon, OFFICE_LAT, OFFICE_LON)
+                
+                desc_lower = l.description.lower() or l.title.lower()
+                if any(k in desc_lower for k in SHARED_KEYWORDS): l.likely_shared = True
+                if any(k in desc_lower for k in TEMP_KEYWORDS): l.is_temporary = True
+                
+                if use_llm:
+                    data = llm_extract_details(l.description if l.description else l.title, hf_token, model_id)
+                    l.likely_shared = l.likely_shared or data.get("likely_shared", False)
+                    l.is_temporary = l.is_temporary or data.get("is_temporary", False)
+                    l.furnished = data.get("furnished", l.furnished)
+                    l.has_kitchen = data.get("has_kitchen", l.has_kitchen)
+                    l.has_living_room = data.get("has_living_room", l.has_living_room)
+                    l.has_sofa = data.get("has_sofa", l.has_sofa)
+                    l.has_washing_machine = data.get("has_washing_machine", l.has_washing_machine)
+                    l.has_dishwasher = data.get("has_dishwasher", l.has_dishwasher)
+                    
+                    detail_price = parse_price(l.description)
+                    if detail_price and 400 <= detail_price <= 10000:
+                        if l.price_chf is None or detail_price < l.price_chf:
+                            l.price_chf = detail_price
+                    elif l.price_chf is None: 
+                        l.price_chf = parse_price(l.title)
+                        
+                    if l.available_from is None: l.available_from = parse_date(data.get("available_from")) or parse_date(l.description)
+                    if l.bedrooms is None: l.bedrooms = data.get("bedrooms")
+                else:
+                    detail_price = parse_price(l.description)
+                    if detail_price and 400 <= detail_price <= 10000:
+                        if l.price_chf is None or detail_price < l.price_chf:
+                            l.price_chf = detail_price
+                    elif l.price_chf is None:
+                        l.price_chf = parse_price(l.title)
+                        
+                    if l.available_from is None: l.available_from = parse_date(l.description)
+                    if l.bedrooms is None and l.total_rooms: l.bedrooms = max(1.0, l.total_rooms - 1.0)
+                time.sleep(delay)
+            except Exception as e: logger.error(f"Error {l.url}: {e}")
+    finally:
+        if pw_browser: pw_browser.close()
+        if playwright_obj: playwright_obj.stop()
 
 def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[bool, List[str]]:
     include_unknown = bool(criteria.get("include_unknowns_to_avoid_false_negatives", True))
@@ -564,11 +674,15 @@ def listing_passes_filters(listing: Listing, criteria: Dict[str, Any]) -> Tuple[
         if actual_val is False: reasons.append(error_msg)
     return len(reasons) == 0, reasons
 
-def run(config_path: Path, providers_override: Optional[List[str]] = None, limit: Optional[int] = None):
+def run(config_path: Path, providers_override: Optional[List[str]] = None, limit: Optional[int] = None, use_llm: Optional[bool] = None):
     cfg = load_config(config_path)
     search_cfg = cfg.get("search", {})
     criteria = cfg.get("criteria", {})
     llm_cfg = cfg.get("llm", {})
+    # use_llm: CLI flag overrides config; config key overrides default (True)
+    if use_llm is None:
+        use_llm = bool(llm_cfg.get("enabled", True))
+    logger.info(f"LLM extraction: {'ENABLED' if use_llm else 'DISABLED'}")
     google_key = cfg.get("google_maps_api_key", "")
     msg_path = Path(cfg.get("contact", {}).get("message_template_path", "message_template.txt"))
     msg_template = msg_path.read_text(encoding="utf-8") if msg_path.exists() else "No template found."
@@ -610,7 +724,21 @@ def run(config_path: Path, providers_override: Optional[List[str]] = None, limit
             page += 1
             time.sleep(1)
         logger.info(f"[{provider}] Completed search. Total: {len(provider_listings)}")
-        hydrate_details(provider_listings, 20, 1.0, llm_cfg, google_key)
+        # Build a session with provider cookies so detail-page requests aren't blocked
+        detail_session = requests.Session()
+        cookies_file = p_cfg.get("playwright", {}).get("cookies_file", f"cookies_{provider}.txt")
+        if cookies_file and Path(cookies_file).exists():
+            raw = Path(cookies_file).read_text(encoding="utf-8")
+            parsed_url = urlparse(p_cfg.get("base_url", ""))
+            domain = parsed_url.netloc
+            for part in raw.strip().split(";"):
+                if "=" not in part: continue
+                name, value = part.strip().split("=", 1)
+                detail_session.cookies.set(name.strip(), value.strip(), domain=domain)
+            logger.info(f"[{provider}] Loaded cookies into detail session for {domain}")
+        
+        provider_pw_cfg = p_cfg.get("playwright") if p_cfg.get("use_playwright_fallback") else None
+        hydrate_details(provider_listings, 20, 1.0, llm_cfg, google_key, use_llm=use_llm, session=detail_session, playwright_cfg=provider_pw_cfg)
         all_listings.extend(provider_listings)
         if limit and len(all_listings) >= limit: break
     filtered, excluded = [], []
@@ -641,6 +769,10 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--providers")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--no-llm", dest="no_llm", action="store_true",
+                        help="Disable LLM extraction; use keyword matching only")
     args = parser.parse_args()
     selected = [p.strip().lower() for p in args.providers.split(",")] if args.providers else None
-    run(Path(args.config), selected, args.limit)
+    # None means "defer to config"; False means "forced off via CLI"
+    use_llm_flag = False if args.no_llm else None
+    run(Path(args.config), selected, args.limit, use_llm=use_llm_flag)

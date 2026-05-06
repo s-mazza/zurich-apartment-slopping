@@ -3,6 +3,7 @@
 output/
 *.log
 cookies_homegate.txt
+cookies_flatfox.txt
 debug_*.py
 *.json
 *.html
